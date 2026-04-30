@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": false,
+    "useDefineForClassFields": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowJs": false,
+    "types": ["chrome", "node", "vite/client", "svelte"],
+    "baseUrl": ".",
+    "paths": {
+      "$shared/*": ["src/shared/*"],
+      "$bg/*": ["src/background/*"],
+      "$content/*": ["src/content/*"],
+      "$sidepanel/*": ["src/sidepanel/*"],
+      "$options/*": ["src/options/*"],
+      "$onboarding/*": ["src/onboarding/*"],
+      "$offscreen/*": ["src/offscreen/*"]
+    }
+  },
+  "include": ["src/**/*", "tests/**/*", "vite.config.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

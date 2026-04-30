@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>AutoFill — Setup</title>
+    <link rel="stylesheet" href="../sidepanel/style.css" />
+    <style>
+      .step-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+      .phrase-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+      .phrase-cell { padding: 8px; background: #f3f4f6; border: 1px solid var(--border); border-radius: 6px; text-align: center; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .phrase-cell .idx { color: var(--muted); font-size: 10px; margin-right: 4px; }
+    </style>
+  </head>
+  <body>
+    <div class="page" id="app"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

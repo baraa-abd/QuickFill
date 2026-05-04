@@ -22,9 +22,14 @@ import { extractJson, renderPrompt } from '../llm/prompts';
 const sensitiveSet = new Set(SENSITIVE_CANONICAL_KEYS.map((k) => cleanLabel(k)));
 
 const resumeParseResultSchema = z.object({
-  // Accept arrays in addition to scalars — LLMs often return list-type fields
-  // (languages, skills, etc.) as arrays. foldResumeIntoProfile joins them.
-  profile: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.unknown())])).optional(),
+  // Accept arrays and objects in addition to scalars — LLMs often return list-type fields
+  // (languages, skills, etc.) as arrays or keyed objects. foldResumeIntoProfile coerces them.
+  profile: z
+    .record(
+      z.string(),
+      z.union([z.string(), z.number(), z.boolean(), z.array(z.unknown()), z.record(z.string(), z.unknown())])
+    )
+    .optional(),
   stories: z
     .array(
       z.object({
@@ -81,7 +86,7 @@ export async function parseResume(
  * Exported for the unit-test pass — keeps the LLM call out of the test loop.
  */
 export function foldResumeIntoProfile(input: {
-  profile?: Record<string, string | number | boolean>;
+  profile?: Record<string, string | number | boolean | unknown[] | Record<string, unknown>>;
   stories?: Array<{ content: string; keywords?: string[] }>;
 }): ResumeParsed {
   const profile: Profile = { aliasMap: {}, canonicalData: {}, sensitiveKeys: [] };
@@ -91,9 +96,14 @@ export function foldResumeIntoProfile(input: {
       const key = cleanLabel(rawKey);
       if (!key) continue;
       // Coerce arrays (e.g. ["Python", "JS"]) → comma-separated string.
+      // Coerce objects (e.g. {"Python": "advanced"}) → "Python (advanced), JS" style.
       const coerced = Array.isArray(rawVal)
         ? rawVal.filter((v) => v != null && v !== '').join(', ')
-        : rawVal;
+        : rawVal !== null && typeof rawVal === 'object'
+          ? Object.entries(rawVal as Record<string, unknown>)
+              .map(([k, v]) => (v != null && v !== '' ? `${k} (${v})` : k))
+              .join(', ')
+          : rawVal;
       const value = String(coerced ?? '').trim();
       if (!value) continue;
       const existing = profile.canonicalData[key];

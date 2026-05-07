@@ -50,22 +50,15 @@
 {/if}
 
 {#if phase === 'loading'}
-  <header class="row" style="justify-content: space-between; margin-bottom: 12px;">
-    <h1>AutoFill</h1>
-  </header>
   <p class="muted">Loading…</p>
 {:else if phase === 'setup'}
-  <header class="row" style="justify-content: space-between; margin-bottom: 12px;">
-    <h1>AutoFill</h1>
-  </header>
   <div class="card col">
     <h2>Setup needed</h2>
     <p class="muted">Welcome. Run the one-time setup to create your encrypted vault.</p>
     <button class="primary" onclick={openOnboarding}>Open setup</button>
   </div>
 {:else if phase === 'locked'}
-  <header class="row" style="justify-content: space-between; margin-bottom: 12px;">
-    <h1>AutoFill</h1>
+  <header class="row" style="justify-content: flex-end; margin-bottom: 12px;">
     <button onclick={openOptions} title="Options">⚙</button>
   </header>
   <LockScreen onUnlocked={refresh} />

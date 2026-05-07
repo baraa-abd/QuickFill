@@ -7,7 +7,7 @@
 // it explicitly.
 
 import type { FieldType } from '$shared/types';
-import { closestAncestor } from './shadow';
+import { closestAncestor, waitForElement } from './shadow';
 
 // Pre-cached prototype setters. These exist regardless of any framework patching.
 const inputValueSetter = Object.getOwnPropertyDescriptor(
@@ -49,9 +49,16 @@ export type CommitResult = CommitOk | CommitError;
  * For selects, the value must match an option's `value` (the chooser prompt
  * upstream is responsible for picking a viable string).
  */
-export function commitValue(el: Element, fieldType: FieldType, value: string): CommitResult {
+export async function commitValue(el: Element, fieldType: FieldType, value: string): Promise<CommitResult> {
   if (!el.isConnected) {
     return { ok: false, kind: 'detached', message: 'element is detached from the document' };
+  }
+
+  // ARIA listbox (e.g. Workday custom dropdowns) is handled before the
+  // try/finally focus-restoration wrapper. Restoring focus after option.click()
+  // triggers Workday's blur/click-outside handler which resets the selection.
+  if (fieldType === 'select' && el instanceof HTMLButtonElement && el.getAttribute('aria-haspopup') === 'listbox') {
+    return commitAriaListbox(el, value);
   }
 
   const previousActive = (el.ownerDocument?.activeElement as HTMLElement | null) ?? null;
@@ -89,8 +96,9 @@ export function commitValue(el: Element, fieldType: FieldType, value: string): C
         return { ok: true };
       }
       case 'select': {
+        // Native <select>.
         if (!(el instanceof HTMLSelectElement)) {
-          return { ok: false, kind: 'unsupported-field', message: 'expected HTMLSelectElement' };
+          return { ok: false, kind: 'unsupported-field', message: 'expected HTMLSelectElement or ARIA listbox button' };
         }
         if (!selectValueSetter) {
           return { ok: false, kind: 'no-setter', message: 'no native select value setter' };
@@ -142,10 +150,16 @@ export function commitValue(el: Element, fieldType: FieldType, value: string): C
             message: `no radio in group "${el.name}" matches "${value}"`
           };
         }
-        if (checkboxCheckedSetter) checkboxCheckedSetter.call(target, true);
-        else target.checked = true;
-        fire(target, 'input');
-        fire(target, 'change');
+        // Prefer click() — it propagates through React's event delegation so
+        // controlled components update correctly. Fall back to the native setter
+        // + synthetic events if click() was suppressed (preventDefault).
+        target.click();
+        if (!target.checked) {
+          if (checkboxCheckedSetter) checkboxCheckedSetter.call(target, true);
+          else target.checked = true;
+          fire(target, 'input');
+          fire(target, 'change');
+        }
         return { ok: true };
       }
       case 'contenteditable': {
@@ -194,6 +208,31 @@ export function commitValue(el: Element, fieldType: FieldType, value: string): C
       }
     }
   }
+}
+
+async function commitAriaListbox(button: HTMLButtonElement, value: string): Promise<CommitResult> {
+  button.click();
+  const firstOption = await waitForElement('[role="option"]', 2000, button.ownerDocument);
+  if (!firstOption) {
+    button.click(); // toggle-close
+    return { ok: false, kind: 'no-matching-option', message: 'listbox options did not appear' };
+  }
+  // aria-controls is set (or updated) after open — read it now.
+  const listboxId = button.getAttribute('aria-controls');
+  const searchRoot =
+    (listboxId ? button.ownerDocument.getElementById(listboxId) : null) ??
+    button.ownerDocument.querySelector('[role="listbox"]') ??
+    button.ownerDocument.documentElement;
+  const needle = value.trim().toLowerCase();
+  const option = Array.from(searchRoot.querySelectorAll<HTMLElement>('[role="option"]')).find(
+    (o) => !o.getAttribute('aria-disabled') && (o.textContent?.trim().toLowerCase() ?? '') === needle
+  );
+  if (!option) {
+    button.click(); // toggle-close
+    return { ok: false, kind: 'no-matching-option', message: `no option matches "${value}"` };
+  }
+  option.click();
+  return { ok: true };
 }
 
 function matchSelectOption(sel: HTMLSelectElement, value: string): HTMLOptionElement | null {

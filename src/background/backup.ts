@@ -22,7 +22,10 @@ import type {
 import { b64decode, b64encode, newIv, newSalt } from './storage/crypto';
 
 export const BACKUP_FORMAT = 'backup/v1' as const;
-export const BACKUP_VERSION = 1;
+// Bumped to 2 when group-template support landed. Older v1 backups still
+// import cleanly because Profile.groupTemplates uses `.catch([])` in the zod
+// schema — older payloads simply produce empty templates.
+export const BACKUP_VERSION = 2;
 
 type BS = BufferSource;
 const asBS = (u: Uint8Array): BS => u as unknown as BS;

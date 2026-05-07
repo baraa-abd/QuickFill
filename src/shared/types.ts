@@ -10,7 +10,8 @@ export type PromptTaskName =
   | 'story_answer_prompt'
   | 'resume_parse'
   | 'story_discovery'
-  | 'generic_key';
+  | 'generic_key'
+  | 'alias_judge';
 
 // ───────────────────────── Profile ─────────────────────────
 
@@ -21,11 +22,61 @@ export type ProfileValue = {
   updatedAt: number;
 };
 
+// Group templates (e.g. "Work Experience", "Education") — schema-typed lists
+// of records. Each template defines an ordered list of keys; each record is a
+// "filling-in" of those keys. One record is the default; the rest are
+// reachable via the side-panel navigator (Alt+, / Alt+.).
+//
+// Per-template-key aliases live on the key (NOT in the global Profile.aliasMap)
+// to avoid collisions when a label like "company" exists in both flat profile
+// and one or more templates. The matcher consults flat aliases first, then
+// each template's per-key aliases, returning a ranked candidate list.
+export type GroupTemplateKeyType = 'string' | 'number' | 'boolean' | 'array';
+
+export type GroupTemplateKey = {
+  /** Cleaned canonical key for this slot, e.g. 'job title'. */
+  key: string;
+  /** Hint for the Profile editor widget + fill-time coercion. Storage is still
+   *  a string (or string[] for array). */
+  type: GroupTemplateKeyType;
+  /** Cleaned aliases, NOT including the identity entry (key itself). */
+  aliases: string[];
+  /** Excluded from cloud-LLM prompts, same as Profile.sensitiveKeys. */
+  sensitive: boolean;
+};
+
+export type GroupRecord = {
+  id: string;
+  /** Single value per (record, key). For 'array' typed keys, stored as string[].
+   *  Missing keys mean "no value yet." */
+  values: Record<string, string | string[]>;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type GroupTemplate = {
+  id: string;
+  /** User-visible name, e.g. 'Work Experience'. */
+  name: string;
+  /** Ordered for display in the editor + the navigator card. */
+  keys: GroupTemplateKey[];
+  /** Ordered for display + navigator step order. */
+  records: GroupRecord[];
+  /** Initial record shown in the navigator on first match. Null when there
+   *  are no records yet. */
+  defaultRecordId: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type Profile = {
   // alias label → canonical key. Includes identity entry (K → K) for every K.
   aliasMap: Record<string, string>;
   canonicalData: Record<string, ProfileValue>;
   sensitiveKeys: string[];
+  /** Group templates (work experience, education, …). Empty for fresh installs
+   *  and for backups produced before group-template support landed. */
+  groupTemplates: GroupTemplate[];
 };
 
 // ───────────────────────── Answer history ─────────────────────────
@@ -96,6 +147,43 @@ export type Settings = {
     logPayloads: boolean;
     showDiagnostics: boolean;
   };
+  session: {
+    /** Session-inactivity ceiling in minutes. The fill session auto-aborts
+     *  after this many minutes without any panel/content event. The timer is
+     *  reset on every inbound port event (panel button, manual-highlight
+     *  selection, navigator key, panel keepalive heartbeat, …) so user
+     *  activity holds the session open indefinitely. */
+    inactivityMinutes: number;
+  };
+  /** Keyboard shortcuts for the group-template record navigator. The Alt
+   *  modifier is fixed; only the key character is rebindable. These are NOT
+   *  Chrome commands (the manifest is at the 4-shortcut cap) — they're
+   *  intercepted by keydown listeners in the content script and side panel. */
+  navigator: {
+    /** Default ','. */
+    prevKey: string;
+    /** Default '.'. */
+    nextKey: string;
+  };
+  detector: {
+    /** Max characters of cleaned ancestor outerHTML sent to the classifier. Default 15000. */
+    maxAncestorHtml: number;
+    /** Max characters of ancestor innerText sidecar. Default 300. */
+    maxAncestorInnerText: number;
+    /** Max ancestor levels climbed when looking for a sibling form control. Default 7.
+     *  This bound is the hard ceiling for *both* the search-for-second-control
+     *  step AND the additional climb beyond it (see
+     *  `extraAncestorLevelsAfterMatch`). */
+    maxAncestorLevels: number;
+    /** Once an ancestor whose subtree contains a form control distinct from
+     *  the focused element is found, the detective climbs this many levels
+     *  further before snapshotting the HTML. Some sites bury the question
+     *  text high above the input, so a value of 2+ is sometimes needed.
+     *  Default 2. Clamped at runtime by `maxAncestorLevels - matchedIndex`. */
+    extraAncestorLevelsAfterMatch: number;
+    /** Attribute values longer than this are truncated during HTML cleaning. Default 120. */
+    maxAttrValueLen: number;
+  };
   customContextWindows: Record<string, number>;
 };
 
@@ -138,9 +226,11 @@ export type FillPlan = {
     siteName: string | null;
     h1: string | null;
   };
-  /** outerHTML of the grandparent element (parent's parent) — structural context for the classifier. */
-  grandparentHtml: string | null;
-  /** Compact tag + key attributes identifying the focused field within grandparentHtml. */
+  /** Cleaned + pruned outerHTML of a smartly chosen ancestor — structural context for the classifier. The focused element is tagged with `data-quickfill-focus="1"`. */
+  ancestorHtml: string | null;
+  /** Plain-text innerText of the same ancestor (capped) as a noise-free sidecar. */
+  ancestorInnerText: string | null;
+  /** Compact tag + key attributes identifying the focused field — fallback when ancestorHtml is null. */
   elementDescriptor: string;
   elementRef: string;
   tabId: number;

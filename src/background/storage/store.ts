@@ -59,7 +59,8 @@ export const SESSION_KEYS = {
   activeApplication: 'session.activeApplication',
   isActive: 'session.isActive',
   activeTabId: 'session.activeTabId',
-  recentActivity: 'session.recentActivity'
+  recentActivity: 'session.recentActivity',
+  recordContext: 'session.recordContext'
 } as const;
 
 // ───────────────────────── value shapes per key ─────────────────────────
@@ -161,7 +162,12 @@ class StoreImpl {
     await this.stashDekToSession();
 
     // Seed default settings + empty profile.
-    const emptyProfile: Profile = { aliasMap: {}, canonicalData: {}, sensitiveKeys: [] };
+    const emptyProfile: Profile = {
+      aliasMap: {},
+      canonicalData: {},
+      sensitiveKeys: [],
+      groupTemplates: []
+    };
     await this.set('settings', DEFAULT_SETTINGS);
     await this.set('profile', emptyProfile);
     await this.set('stories', []);
@@ -288,7 +294,16 @@ class StoreImpl {
     const v = await chrome.storage.local.get(key);
     const blob = v[key] as StoredBlob | undefined;
     if (!blob) return null;
-    return decryptBlob<EncryptedValueByKey[K]>(blob, this.dek);
+    const decoded = await decryptBlob<EncryptedValueByKey[K]>(blob, this.dek);
+    // Migration shim: profiles persisted before group-template support arrived
+    // lack `groupTemplates`. Default to [] on read; the next set() persists it.
+    if (key === 'profile' && decoded && typeof decoded === 'object') {
+      const p = decoded as unknown as Profile;
+      if (!Array.isArray(p.groupTemplates)) {
+        p.groupTemplates = [];
+      }
+    }
+    return decoded;
   }
 
   async set<K extends EncryptedKey>(key: K, value: EncryptedValueByKey[K]): Promise<void> {

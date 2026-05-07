@@ -76,7 +76,7 @@
   });
 </script>
 
-<header><h1>AutoFill — Options</h1></header>
+<header><h1>QuickFill — Options</h1></header>
 
 {#if phase === 'loading'}
   <p class="muted">Loading…</p>

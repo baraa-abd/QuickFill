@@ -11,7 +11,8 @@
     { id: 'story_answer_prompt', label: 'Story answer', vars: ['active_application', 'profile', 'stories', 'history', 'field_label', 'max_length'] },
     { id: 'resume_parse', label: 'Resume parse', vars: ['resume_text'] },
     { id: 'story_discovery', label: 'Story discovery', vars: ['active_application', 'field_label', 'answer', 'stories'] },
-    { id: 'generic_key', label: 'Generic key', vars: ['company_name', 'role', 'user_blurb'] }
+    { id: 'generic_key', label: 'Generic key', vars: ['company_name', 'role', 'user_blurb'] },
+    { id: 'alias_judge', label: 'Alias judge', vars: ['canonical_key', 'field_label', 'ancestor_html'] }
   ];
 
   let settings: Settings = $state(structuredClone(DEFAULT_SETTINGS));

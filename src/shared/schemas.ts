@@ -11,7 +11,8 @@ export const promptTaskNameSchema = z.enum([
   'story_answer_prompt',
   'resume_parse',
   'story_discovery',
-  'generic_key'
+  'generic_key',
+  'alias_judge'
 ]);
 
 export const fieldTypeSchema = z.enum([
@@ -41,10 +42,38 @@ export const profileValueSchema = z.object({
   updatedAt: z.number()
 });
 
+export const groupTemplateKeyTypeSchema = z.enum(['string', 'number', 'boolean', 'array']);
+
+export const groupTemplateKeySchema = z.object({
+  key: z.string(),
+  type: groupTemplateKeyTypeSchema,
+  aliases: z.array(z.string()).catch([]),
+  sensitive: z.boolean().catch(false)
+});
+
+export const groupRecordSchema = z.object({
+  id: z.string(),
+  values: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
+  createdAt: z.number(),
+  updatedAt: z.number()
+});
+
+export const groupTemplateSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  keys: z.array(groupTemplateKeySchema),
+  records: z.array(groupRecordSchema),
+  defaultRecordId: z.string().nullable(),
+  createdAt: z.number(),
+  updatedAt: z.number()
+});
+
 export const profileSchema = z.object({
   aliasMap: z.record(z.string(), z.string()),
   canonicalData: z.record(z.string(), profileValueSchema),
-  sensitiveKeys: z.array(z.string())
+  sensitiveKeys: z.array(z.string()),
+  // Backwards-compat: pre-template profiles parse cleanly with []
+  groupTemplates: z.array(groupTemplateSchema).catch([])
 });
 
 // ───────────────────────── History ─────────────────────────
@@ -108,6 +137,38 @@ export const settingsSchema = z.object({
     logPayloads: z.boolean(),
     showDiagnostics: z.boolean().catch(false)
   }),
+  // Backwards-compat: stored settings from before the session-timeout setting
+  // landed don't carry this object — `.catch({…})` falls back to the default.
+  session: z
+    .object({
+      inactivityMinutes: z.number().min(1).max(720)
+    })
+    .catch({ inactivityMinutes: 15 }),
+  // Backwards-compat: older stored settings lack this object.
+  // Navigator shortcuts. Each must be a single non-empty character.
+  navigator: z
+    .object({
+      prevKey: z.string().min(1).max(1),
+      nextKey: z.string().min(1).max(1)
+    })
+    .catch({ prevKey: ',', nextKey: '.' }),
+  // Backwards-compat: older stored settings lack this object.
+  detector: z
+    .object({
+      maxAncestorHtml:               z.number().int().min(1000).max(100000),
+      maxAncestorInnerText:          z.number().int().min(50).max(2000),
+      maxAncestorLevels:             z.number().int().min(1).max(20),
+      // Defaults to 2 if missing (older stored settings predate this knob).
+      extraAncestorLevelsAfterMatch: z.number().int().min(0).max(20).catch(2),
+      maxAttrValueLen:               z.number().int().min(20).max(500)
+    })
+    .catch({
+      maxAncestorHtml:               15000,
+      maxAncestorInnerText:          300,
+      maxAncestorLevels:             7,
+      extraAncestorLevelsAfterMatch: 2,
+      maxAttrValueLen:               120
+    }),
   customContextWindows: z.record(z.string(), z.number())
 });
 
@@ -135,7 +196,8 @@ export const fillPlanSchema = z.object({
     siteName: z.string().nullable(),
     h1: z.string().nullable()
   }),
-  grandparentHtml: z.string().nullable().catch(null),
+  ancestorHtml: z.string().nullable().catch(null),
+  ancestorInnerText: z.string().nullable().catch(null),
   elementDescriptor: z.string().catch(''),
   elementRef: z.string(),
   tabId: z.number(),

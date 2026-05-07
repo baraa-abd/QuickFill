@@ -8,17 +8,23 @@
   import DraftArea from './DraftArea.svelte';
   import ProfileUpdateCard from './ProfileUpdateCard.svelte';
   import DedupToast from './DedupToast.svelte';
+  import AliasAddedToast from './AliasAddedToast.svelte';
   import StoryDiscoveryPrompt from './StoryDiscoveryPrompt.svelte';
   import AddToProfileCard from './AddToProfileCard.svelte';
   import FillHistory from './FillHistory.svelte';
   import SaveHistory from './SaveHistory.svelte';
   import DiagnosticPanel from './DiagnosticPanel.svelte';
+  import RecordNavigator from './RecordNavigator.svelte';
   import type { ActiveApplication } from '$shared/types';
 
   const session = new SessionStore();
 
   let activeApplication: ActiveApplication | null = $state(null);
   let sensitiveBadge = $state(false);
+  // Navigator keys, mirrored from settings. Defaults match
+  // DEFAULT_SETTINGS.navigator and are overwritten in onMount.
+  let navPrevKey = $state(',');
+  let navNextKey = $state('.');
 
   async function refreshActiveApplication() {
     const r = await rpcCall('get-active-application', {});
@@ -35,6 +41,10 @@
       const isCloud = settings.value.activeBackend !== 'ollama';
       const hasSensitive = (profile.value as { sensitiveKeys: string[] }).sensitiveKeys.length > 0;
       sensitiveBadge = isCloud && hasSensitive;
+      // Mirror navigator-key prefs into the panel-side keydown listener.
+      const nav = settings.value.navigator as { prevKey?: string; nextKey?: string } | undefined;
+      if (nav?.prevKey) navPrevKey = nav.prevKey;
+      if (nav?.nextKey) navNextKey = nav.nextKey;
     } catch {
       /* */
     }
@@ -45,18 +55,42 @@
     refreshActiveApplication();
     refreshSensitiveBadge();
 
+    // Reset the SW's session-inactivity timer on any user interaction within
+    // the panel (typing in the draft, clicking buttons, focusing inputs).
+    // The post is a no-op if no session is active, so it's cheap to wire
+    // broadly. Capture-phase so input that calls stopPropagation still resets.
+    const onInteract = () => session.postKeepalive();
+    window.addEventListener('pointerdown', onInteract, true);
+    window.addEventListener('keydown', onInteract, true);
+    window.addEventListener('input', onInteract, true);
+
     // Window-level keyboard shortcuts:
-    //   Esc → abort the active session (matches the page-side handler).
-    //   Enter (only when in manual_highlight phase, and not while the user is
-    //         typing in an input/textarea inside the panel) → submit the
-    //         current page selection. The page-side Enter handler (when the
-    //         iframe / page has focus) also submits; the panel handler
-    //         covers the case where focus stayed in the panel after the
-    //         user drag-selected on the page.
+    //   Esc       → abort the active session (matches the page-side handler).
+    //   Enter     → submit manual highlight selection (manual_highlight phase only,
+    //               not while the user is typing in a panel input/textarea).
+    //               The page-side Enter handler also submits; this covers the
+    //               case where focus stayed in the panel after drag-select.
+    //   Alt+,     → previous record (navigating phase only, mirrors the content
+    //   Alt+.       script listener that fires when the page has focus).
     function onKeydown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
         session.postAbort();
         return;
+      }
+      // Alt+<prev>/Alt+<next> — step through group-template records. Only
+      // active while the navigator card is mounted; completely inert otherwise.
+      // The keys come from settings (defaults: ',' and '.').
+      if (e.altKey && session.navigator) {
+        if (e.key === navPrevKey) {
+          e.preventDefault();
+          session.postNavigatorPrev();
+          return;
+        }
+        if (e.key === navNextKey) {
+          e.preventDefault();
+          session.postNavigatorNext();
+          return;
+        }
       }
       if (e.key === 'Enter' && session.phase === 'manual_highlight') {
         const t = e.target as HTMLElement | null;
@@ -77,6 +111,9 @@
     return () => {
       window.removeEventListener('keydown', onKeydown, true);
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener('pointerdown', onInteract, true);
+      window.removeEventListener('keydown', onInteract, true);
+      window.removeEventListener('input', onInteract, true);
       session.stop();
     };
   });
@@ -95,8 +132,7 @@
   }
 </script>
 
-<header class="row" style="justify-content: space-between; margin-bottom: 8px;">
-  <h1>AutoFill</h1>
+<header class="row" style="justify-content: flex-end; margin-bottom: 8px;">
   <div class="row" style="gap: 6px;">
     <button onclick={openOptions} title="Options">⚙</button>
     <button onclick={lock} title="Lock vault">🔒</button>
@@ -220,6 +256,17 @@
   />
 {/if}
 
+{#each session.aliasToasts as toast (toast.id)}
+  <AliasAddedToast
+    {toast}
+    onDelete={() => {
+      session.postDeleteAlias(toast);
+      session.dismissAliasToast(toast.id);
+    }}
+    onDismiss={() => session.dismissAliasToast(toast.id)}
+  />
+{/each}
+
 {#if session.dedupMerge}
   <DedupToast
     merge={session.dedupMerge}
@@ -239,6 +286,18 @@
       session.storyDiscovered = null;
     }}
     onDismiss={() => (session.storyDiscovered = null)}
+  />
+{/if}
+
+<!-- Group-template navigator. Active after a template-match auto-commit;
+     stays visible until Esc / a new fill / explicit close. -->
+{#if session.navigator}
+  <RecordNavigator
+    nav={session.navigator}
+    onPrev={() => session.postNavigatorPrev()}
+    onNext={() => session.postNavigatorNext()}
+    onJump={(rid) => session.postNavigatorJump(rid)}
+    onClose={() => session.postNavigatorClose()}
   />
 {/if}
 

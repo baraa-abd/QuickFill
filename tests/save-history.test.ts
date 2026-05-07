@@ -38,6 +38,7 @@ describe('SaveHistory', () => {
             canonicalKey: 'first name',
             value: 'Ada',
             source: 'profile',
+            alternativeValues: [],
             tabId: 1,
             frameId: 0,
             elementRef: 'r',

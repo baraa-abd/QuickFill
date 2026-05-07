@@ -32,10 +32,20 @@ import type { FieldType } from '$shared/types';
 (() => {
   let port: TypedPort | null = null;
   let escWired = false;
+  let navKeysWired = false;
 
   // elementRef → element. WeakRef so detached nodes can be GC'd.
   const refs = new Map<string, WeakRef<Element>>();
   let sessionActive = false;
+  // True while the group-template navigator is open in the side panel.
+  // Gating on this flag ensures we only intercept Alt+, / Alt+. during an
+  // active navigator session and never interfere with normal page interaction.
+  let navigatorActive = false;
+  // Navigator keys are pushed by the SW via the `navigator-active` message
+  // (which carries the user-rebound values from settings). Defaults match
+  // DEFAULT_SETTINGS.navigator and are used if an older SW elides them.
+  let navPrevKey = ',';
+  let navNextKey = '.';
 
   function newRef(el: Element): string {
     const id =
@@ -69,8 +79,37 @@ import type { FieldType } from '$shared/types';
     );
   }
 
+  /**
+   * Wire the Alt+, / Alt+. keydown listener once for the lifetime of this
+   * content script. The listener only acts when `navigatorActive` is true,
+   * so it is completely inert during normal page interaction.
+   *
+   * We use the capture phase (third arg `true`) so the handler runs before
+   * the page's own listeners — necessary for preventDefault to stop any
+   * page-side Alt+, / Alt+. bindings from also firing.
+   */
+  function ensureNavKeys() {
+    if (navKeysWired) return;
+    navKeysWired = true;
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        if (!e.altKey || !navigatorActive || !port) return;
+        if (e.key === navPrevKey) {
+          e.preventDefault();
+          port.post({ t: 'navigator-prev' });
+        } else if (e.key === navNextKey) {
+          e.preventDefault();
+          port.post({ t: 'navigator-next' });
+        }
+      },
+      true
+    );
+  }
+
   function endSession() {
     sessionActive = false;
+    navigatorActive = false;
     stopManualHighlight();
   }
 
@@ -109,7 +148,7 @@ import type { FieldType } from '$shared/types';
       setTimeout(connect, 200);
     });
 
-    port.on((ev) => {
+    port.on(async (ev) => {
       switch (ev.t) {
         case 'run-detective': {
           // CRITICAL: synchronously read activeElement BEFORE any await.
@@ -127,7 +166,7 @@ import type { FieldType } from '$shared/types';
             return;
           }
           const focused = document.activeElement as Element;
-          const result = runDetective(focused);
+          const result = await runDetective(focused, ev.detector);
           if (result.rejected) {
             port?.post({
               t: 'detective-failed',
@@ -144,7 +183,8 @@ import type { FieldType } from '$shared/types';
               options: result.options,
               currentValue: result.currentValue,
               pageContext: result.pageContext,
-              grandparentHtml: result.grandparentHtml,
+              ancestorHtml: result.ancestorHtml,
+              ancestorInnerText: result.ancestorInnerText,
               elementDescriptor: result.elementDescriptor,
               elementRef,
               tabId: -1, // SW will overwrite from sender.tab.id
@@ -167,12 +207,27 @@ import type { FieldType } from '$shared/types';
           break;
         }
 
+        case 'navigator-active': {
+          // SW tells us to start or stop intercepting Alt+<prev>/Alt+<next>.
+          // Sent when entering / leaving the 'navigating' phase. The keys
+          // come from user settings (default ',' and '.').
+          navigatorActive = ev.active;
+          if (ev.active) {
+            if (ev.prevKey) navPrevKey = ev.prevKey;
+            if (ev.nextKey) navNextKey = ev.nextKey;
+          }
+          break;
+        }
+
         case 'manual-highlight-stop': {
           stopManualHighlight();
           break;
         }
 
         case 'close': {
+          // endSession() also clears navigatorActive, so the keydown listener
+          // becomes inert again even if we never got an explicit
+          // navigator-active:false (e.g. on abort or session end).
           endSession();
           break;
         }
@@ -205,7 +260,7 @@ import type { FieldType } from '$shared/types';
     if (
       typeof msg !== 'object' ||
       msg == null ||
-      (msg as { __autofill_commit__?: unknown }).__autofill_commit__ !== true
+      (msg as { __quickfill_commit__?: unknown }).__quickfill_commit__ !== true
     ) {
       return false;
     }
@@ -219,10 +274,12 @@ import type { FieldType } from '$shared/types';
       sendResponse({ ok: false, kind: 'unsupported-field', message: 'unsupported field type' });
       return false;
     }
-    const r = commitValue(el, m.fieldType, m.value);
-    sendResponse(r);
-    return false;
+    commitValue(el, m.fieldType, m.value).then(sendResponse);
+    return true; // async response
   });
 
+  // Wire Alt+, / Alt+. interception once at module load. The listener is
+  // completely inert until the SW sends navigator-active:true.
+  ensureNavKeys();
   connect();
 })();

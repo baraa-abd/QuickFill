@@ -4,8 +4,8 @@
 // a given element. The element ref must be captured synchronously by the
 // caller BEFORE any await — see content/index.ts.
 
-import type { FieldType } from '$shared/types';
-import { ancestorsUpTo, closestAncestor, resolveIdRefs } from './shadow';
+import type { FieldType, Settings } from '$shared/types';
+import { ancestorsUpTo, closestAncestor, resolveIdRefs, waitForElement } from './shadow';
 
 export type DetectiveResult = {
   question: string | null;
@@ -18,9 +18,17 @@ export type DetectiveResult = {
     siteName: string | null;
     h1: string | null;
   };
-  /** outerHTML of el.parentElement?.parentElement, capped at MAX_GRANDPARENT_HTML chars. */
-  grandparentHtml: string | null;
-  /** Compact tag + key attributes for the focused element — enough to identify it inside grandparentHtml. */
+  /**
+   * Cleaned + pruned outerHTML of a smartly chosen ancestor of the focused
+   * element (climb up to the first ancestor containing a *different* input
+   * field, plus one more level, capped at 6 levels). The focused element
+   * carries a `data-quickfill-focus="1"` marker so the classifier can locate
+   * it inside the snippet. Capped at MAX_ANCESTOR_HTML chars.
+   */
+  ancestorHtml: string | null;
+  /** Plain-text innerText of the same ancestor, capped at MAX_ANCESTOR_INNER_TEXT chars. */
+  ancestorInnerText: string | null;
+  /** Compact tag + key attributes for the focused element — fallback identifier when ancestorHtml is null. */
   elementDescriptor: string;
   rejected: 'disabled' | 'readonly' | 'file' | null;
 };
@@ -102,7 +110,15 @@ function cssEscape(s: string): string {
 
 // ───────────────────────── field type + options + current value ─────────────────────────
 
+function isAriaListboxButton(el: Element): el is HTMLButtonElement {
+  return el instanceof HTMLButtonElement && el.getAttribute('aria-haspopup') === 'listbox';
+}
+
 export function classifyFieldType(el: Element): { fieldType: FieldType; rejected: DetectiveResult['rejected'] } {
+  if (el instanceof HTMLButtonElement) {
+    if (el.disabled) return { fieldType: 'unknown', rejected: 'disabled' };
+    if (el.getAttribute('aria-haspopup') === 'listbox') return { fieldType: 'select', rejected: null };
+  }
   if (el instanceof HTMLInputElement) {
     if (el.disabled) return { fieldType: 'unknown', rejected: 'disabled' };
     if (el.readOnly) return { fieldType: 'unknown', rejected: 'readonly' };
@@ -143,9 +159,12 @@ function isContentEditableEl(el: HTMLElement): boolean {
   return v === '' || v === 'true' || v === 'plaintext-only';
 }
 
-export function getOptions(el: Element, fieldType: FieldType): string[] | null {
+export async function getOptions(el: Element, fieldType: FieldType): Promise<string[] | null> {
   if (fieldType === 'select' && el instanceof HTMLSelectElement) {
     return Array.from(el.options).map((o) => o.label || o.text || o.value);
+  }
+  if (fieldType === 'select' && isAriaListboxButton(el)) {
+    return extractListboxOptions(el);
   }
   if (fieldType === 'radio' && el instanceof HTMLInputElement && el.name) {
     const root = el.getRootNode() as Document | ShadowRoot;
@@ -162,6 +181,26 @@ export function getOptions(el: Element, fieldType: FieldType): string[] | null {
   return null;
 }
 
+async function extractListboxOptions(button: HTMLButtonElement): Promise<string[]> {
+  button.click();
+  // Wait for options to be populated, not just the listbox container.
+  const firstOption = await waitForElement('[role="option"]', 2000, button.ownerDocument);
+  let options: string[] = [];
+  if (firstOption) {
+    // Prefer the listbox aria-controls points to; fall back to any listbox.
+    const listboxId = button.getAttribute('aria-controls');
+    const searchRoot = (listboxId ? button.ownerDocument.getElementById(listboxId) : null)
+      ?? button.ownerDocument.querySelector('[role="listbox"]')
+      ?? button.ownerDocument.documentElement;
+    options = Array.from(searchRoot.querySelectorAll('[role="option"]'))
+      .map((o) => (o as HTMLElement).textContent?.trim() ?? '')
+      .filter(Boolean);
+  }
+  // Close by toggling — clicking the button again is more reliable than Escape.
+  button.click();
+  return options;
+}
+
 function labelForRadio(r: HTMLInputElement): string {
   // Associated <label> via for=, ancestor, or sibling text.
   if (r.id) {
@@ -175,6 +214,12 @@ function labelForRadio(r: HTMLInputElement): string {
 }
 
 export function getCurrentValue(el: Element): string {
+  if (isAriaListboxButton(el)) {
+    // Prefer the companion hidden text input (Workday pattern); fall back to
+    // the button's own value attribute, which Workday also keeps in sync.
+    const companion = el.parentElement?.querySelector<HTMLInputElement>('input[type="text"]');
+    return companion?.value.trim() ?? el.value.trim();
+  }
   if (el instanceof HTMLInputElement) {
     if (el.type === 'checkbox') return el.checked ? 'true' : 'false';
     if (el.type === 'radio') {
@@ -197,28 +242,215 @@ export function getCurrentValue(el: Element): string {
   return '';
 }
 
-// ───────────────────────── grandparent HTML + element descriptor ─────────────────────────
+// ───────────────────────── ancestor HTML + element descriptor ─────────────────────────
 
-const MAX_GRANDPARENT_HTML = 3000;
+// Fallback defaults used when no detector settings are supplied.
+const DEFAULT_MAX_ANCESTOR_HTML = 15000;
+const DEFAULT_MAX_ANCESTOR_INNER_TEXT = 300;
+const DEFAULT_MAX_ANCESTOR_LEVELS = 7;
+const DEFAULT_EXTRA_ANCESTOR_LEVELS_AFTER_MATCH = 2;
+const DEFAULT_MAX_ATTR_VALUE_LEN = 120;
+
+const FOCUS_MARKER_ATTR = 'data-quickfill-focus';
+
+export type DetectorSettings = Settings['detector'];
+
+// Form controls that count as "a different input field" when looking for the
+// smallest ancestor that bundles the focused field with a sibling field.
+// Plain <button>s (e.g. submit/back/menu) are intentionally excluded — they're
+// not data-entry fields.
+const FORM_CONTROL_SELECTOR =
+  'input:not([type="hidden"]),textarea,select,'
+  + 'button[aria-haspopup="listbox"],button[role="combobox"],'
+  + '[contenteditable=""],[contenteditable="true"],[contenteditable="plaintext-only"]';
+
+// Tags whose subtrees carry no useful context for the classifier.
+const STRIP_TAGS = new Set([
+  'SCRIPT', 'STYLE', 'NOSCRIPT', 'LINK', 'META',
+  'SVG', 'IFRAME', 'VIDEO', 'AUDIO', 'CANVAS', 'PICTURE', 'SOURCE'
+]);
+
+// Attributes worth keeping. Everything else (style, class, srcset, on*, most
+// data-*, framework noise) is dropped during cleaning.
+const KEEP_ATTRS = new Set([
+  'id', 'name', 'type', 'placeholder', 'value', 'role',
+  'aria-label', 'aria-labelledby', 'aria-describedby', 'aria-required',
+  'aria-haspopup', 'aria-checked', 'aria-selected', 'aria-disabled',
+  'for', 'checked', 'selected', 'disabled', 'readonly', 'required',
+  'min', 'max', 'step', 'pattern', 'maxlength', 'minlength',
+  'data-label', 'data-question', 'data-field-label', 'data-testid',
+  FOCUS_MARKER_ATTR,
+  'href', 'alt', 'title'
+]);
+
+export type AncestorContext = {
+  html: string | null;
+  innerText: string | null;
+};
 
 /**
- * Returns the `outerHTML` of the focused element's grandparent (parent's
- * parent), hard-capped at MAX_GRANDPARENT_HTML characters. The grandparent
- * typically contains the question label, surrounding options, and the field
- * itself, giving the classifier rich structural context without sending the
- * entire page.
+ * Capture structural + textual context for the classifier.
+ *
+ * 1. Climb up to the smallest ancestor whose subtree contains a *different*
+ *    form control than the focused element, then go `extraAncestorLevelsAfterMatch`
+ *    levels beyond it (capped at MAX_ANCESTOR_LEVELS). This adapts depth to
+ *    the actual form structure rather than using a fixed level.
+ * 2. Clone the chosen ancestor so all subsequent edits are off-DOM.
+ * 3. Tag the focused element's clone with `data-quickfill-focus="1"` so the
+ *    classifier can locate it inside the snippet without relying on
+ *    elementDescriptor matching being unambiguous.
+ * 4. Clean: drop noise tags (script/style/svg/...), drop comments, strip all
+ *    attributes except a small allowlist, truncate long attribute values.
+ * 5. Prune (text-preserving): elements *not* on the focused element's
+ *    ancestor spine are flattened to their visible text — wrapper tag is
+ *    kept so nearby labels remain locatable, but their nested structure
+ *    (deep cousin branches) is discarded.
+ * 6. Truncate: if the result still exceeds MAX_ANCESTOR_HTML, take a window
+ *    ending right after the focused element's closing tag and extending
+ *    backward as far as possible (information before the focus is more
+ *    important — the focus is typically near the bottom of its own
+ *    subtree).
+ *
+ * The plain-text `innerText` of the same ancestor (capped) is returned
+ * alongside as a dense sidecar that's robust to HTML noise.
  */
-export function captureGrandparentHtml(el: Element): string | null {
-  const grandparent = el.parentElement?.parentElement;
-  if (!grandparent) return null;
-  const raw = grandparent.outerHTML;
-  if (raw.length <= MAX_GRANDPARENT_HTML) return raw;
-  return raw.slice(0, MAX_GRANDPARENT_HTML) + '…[truncated]';
+export function captureAncestorContext(el: Element, ds?: DetectorSettings): AncestorContext {
+  const maxLevels    = ds?.maxAncestorLevels    ?? DEFAULT_MAX_ANCESTOR_LEVELS;
+  const extraLevels  = Math.max(
+    0,
+    ds?.extraAncestorLevelsAfterMatch ?? DEFAULT_EXTRA_ANCESTOR_LEVELS_AFTER_MATCH
+  );
+  const maxInnerText = ds?.maxAncestorInnerText ?? DEFAULT_MAX_ANCESTOR_INNER_TEXT;
+  const maxHtml      = ds?.maxAncestorHtml      ?? DEFAULT_MAX_ANCESTOR_HTML;
+  const maxAttrLen   = ds?.maxAttrValueLen      ?? DEFAULT_MAX_ATTR_VALUE_LEN;
+
+  const ancestors: Element[] = [];
+  let cur = el.parentElement;
+  while (cur && ancestors.length < maxLevels) {
+    ancestors.push(cur);
+    cur = cur.parentElement;
+  }
+  if (ancestors.length === 0) return { html: null, innerText: null };
+
+  // Climb to the smallest ancestor whose subtree contains a form control
+  // distinct from the focused element, then continue `extraLevels` more
+  // levels (some sites bury the question text high above the input).
+  // Both steps are jointly capped by `maxLevels` via the `ancestors` array
+  // length: even if extraLevels is large, we never read past the array end.
+  let chosenIdx = ancestors.length - 1;
+  for (let i = 0; i < ancestors.length; i++) {
+    if (containsDifferentFormControl(ancestors[i], el)) {
+      chosenIdx = Math.min(i + extraLevels, ancestors.length - 1);
+      break;
+    }
+  }
+  const ancestor = ancestors[chosenIdx];
+
+  // Path from ancestor down to the focused element (childIndex per level).
+  const path: number[] = [];
+  let p: Element = el;
+  while (p !== ancestor) {
+    const parent = p.parentElement;
+    if (!parent) return { html: null, innerText: null };
+    path.unshift(Array.from(parent.children).indexOf(p));
+    p = parent;
+  }
+
+  const rawText = ((ancestor as HTMLElement).innerText ?? ancestor.textContent ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const innerText = rawText ? rawText.slice(0, maxInnerText) : null;
+
+  const clone = ancestor.cloneNode(true) as Element;
+  let focusedClone: Element | null = clone;
+  for (const idx of path) {
+    const next: Element | undefined = focusedClone?.children[idx];
+    if (!next) { focusedClone = null; break; }
+    focusedClone = next;
+  }
+  if (!focusedClone) return { html: null, innerText };
+
+  focusedClone.setAttribute(FOCUS_MARKER_ATTR, '1');
+  cleanElement(clone, maxAttrLen);
+
+  const spine = new Set<Element>();
+  let n: Element | null = focusedClone;
+  while (n) {
+    spine.add(n);
+    if (n === clone) break;
+    n = n.parentElement;
+  }
+  pruneNonSpine(clone, spine);
+
+  const fullHtml = clone.outerHTML;
+  const html = truncateAroundFocus(fullHtml, focusedClone.outerHTML, maxHtml);
+  return { html, innerText };
+}
+
+function containsDifferentFormControl(ancestor: Element, focused: Element): boolean {
+  const matches = ancestor.querySelectorAll(FORM_CONTROL_SELECTOR);
+  for (const m of matches) if (m !== focused) return true;
+  return false;
+}
+
+function cleanElement(el: Element, maxAttrLen: number): void {
+  // Walk children first so replacements/removals propagate up cleanly.
+  for (const child of Array.from(el.children)) {
+    if (STRIP_TAGS.has(child.tagName)) {
+      child.remove();
+      continue;
+    }
+    cleanElement(child, maxAttrLen);
+  }
+  // Remove comment nodes at this level.
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType === 8 /* COMMENT_NODE */) node.parentNode?.removeChild(node);
+  }
+  // Strip attributes not on the allowlist; truncate long values on those kept.
+  for (const attr of Array.from(el.attributes)) {
+    if (!KEEP_ATTRS.has(attr.name)) {
+      el.removeAttribute(attr.name);
+      continue;
+    }
+    if (attr.value.length > maxAttrLen) {
+      el.setAttribute(attr.name, attr.value.slice(0, maxAttrLen));
+    }
+  }
+}
+
+function pruneNonSpine(root: Element, spine: Set<Element>): void {
+  for (const child of Array.from(root.children)) {
+    if (spine.has(child)) {
+      pruneNonSpine(child, spine);
+      continue;
+    }
+    // Non-spine element: keep its tag + attrs but flatten its subtree to
+    // visible text. Preserves labels/option text while discarding wrapper
+    // depth and cousin nesting.
+    const text = (child.textContent ?? '').replace(/\s+/g, ' ').trim();
+    while (child.firstChild) child.removeChild(child.firstChild);
+    if (text) child.textContent = text;
+  }
+}
+
+function truncateAroundFocus(fullHtml: string, focusOuter: string, maxHtml: number): string {
+  if (fullHtml.length <= maxHtml) return fullHtml;
+  const markerIdx = fullHtml.indexOf(`${FOCUS_MARKER_ATTR}="1"`);
+  if (markerIdx < 0) {
+    return fullHtml.slice(0, maxHtml) + '…[truncated]';
+  }
+  const tagStart = fullHtml.lastIndexOf('<', markerIdx);
+  const tagEnd = tagStart >= 0 ? tagStart + focusOuter.length : markerIdx + focusOuter.length;
+  const safeEnd = Math.min(tagEnd, fullHtml.length);
+  const start = Math.max(0, safeEnd - maxHtml);
+  const sliced = fullHtml.slice(start, safeEnd);
+  return start > 0 ? '…[truncated]…' + sliced : sliced;
 }
 
 /**
  * Produces a compact one-line HTML tag (no children, no value) that uniquely
- * identifies the focused field inside the grandparent HTML. Includes key
+ * identifies the focused field. Used as a fallback identifier when the
+ * ancestor HTML is unavailable. Includes key
  * attributes only: id, name, type, placeholder, aria-label, aria-labelledby,
  * data-testid. Class is intentionally omitted (too noisy with Tailwind etc.).
  */
@@ -247,15 +479,17 @@ export function capturePageContext(): DetectiveResult['pageContext'] {
 
 // ───────────────────────── public entry ─────────────────────────
 
-export function runDetective(el: Element): DetectiveResult {
+export async function runDetective(el: Element, ds?: DetectorSettings): Promise<DetectiveResult> {
   const { fieldType, rejected } = classifyFieldType(el);
+  const ancestor = rejected ? { html: null, innerText: null } : captureAncestorContext(el, ds);
   return {
     question: rejected ? null : climbForLabel(el),
     fieldType,
-    options: rejected ? null : getOptions(el, fieldType),
+    options: rejected ? null : await getOptions(el, fieldType),
     currentValue: rejected ? '' : getCurrentValue(el),
     pageContext: capturePageContext(),
-    grandparentHtml: rejected ? null : captureGrandparentHtml(el),
+    ancestorHtml: ancestor.html,
+    ancestorInnerText: ancestor.innerText,
     elementDescriptor: buildElementDescriptor(el),
     rejected
   };

@@ -33,7 +33,13 @@ import {
 } from './messaging';
 import { warmup } from './rag/embeddings';
 import { Store, SESSION_KEYS } from './storage/store';
-import { FillSessionImpl, type FillActivity, type RecentActivity, type SaveActivity } from './fill-session';
+import {
+  FillSessionImpl,
+  type FillActivity,
+  type RecentActivity,
+  type RecordContext,
+  type SaveActivity
+} from './fill-session';
 import { invalidateMatcherCache } from './matcher';
 
 // ───────────────────────── Boot ─────────────────────────
@@ -92,6 +98,25 @@ function pushActivity(entry: RecentActivity): void {
 function removeActivity(id: string): void {
   const i = recentActivity.findIndex((e) => e.id === id);
   if (i >= 0) recentActivity.splice(i, 1);
+  persistRecentActivity();
+}
+
+/**
+ * Replace an entry in place (used by the navigator when the user switches
+ * records — same FillActivity id, new value/recordIndex). Preserves the
+ * original `previousValue` so a Revert restores the pre-fill state, never an
+ * intermediate record's value.
+ */
+function updateActivity(entry: RecentActivity): void {
+  const i = recentActivity.findIndex((e) => e.id === entry.id);
+  if (i < 0) return;
+  if (entry.kind === 'fill' && recentActivity[i].kind === 'fill') {
+    const original = recentActivity[i] as FillActivity;
+    const next: FillActivity = { ...(entry as FillActivity), previousValue: original.previousValue };
+    recentActivity[i] = next;
+  } else {
+    recentActivity[i] = entry;
+  }
   persistRecentActivity();
 }
 
@@ -180,6 +205,15 @@ chrome.runtime.onConnect.addListener((raw) => {
         void switchFillValue(ev.id, ev.newValue);
         return;
       }
+      if (ev.t === 'delete-alias') {
+        // delete-alias arrives via the alias toast (SW → panel → SW round-
+        // trip); the toast carries the full target so we don't need any
+        // session-local lookup here. Routes directly to the FillSession
+        // helper which handles flat aliasMap entries and template-key
+        // alias arrays uniformly.
+        void session.deleteAliasEntry({ id: ev.id, alias: ev.alias, target: ev.target });
+        return;
+      }
       void session.onPanelEvent(ev);
     });
     port.post({ t: 'ack' });
@@ -197,6 +231,20 @@ chrome.runtime.onConnect.addListener((raw) => {
     // evicted) is cleared on reconnect.
     if (!session.isActive()) {
       port.post({ t: 'close' });
+    } else {
+      // If a navigator is open, re-emit `navigator-open` so a fresh panel
+      // remounts the navigator card without an extra RPC.
+      const nav = session.getNavigatorSnapshot();
+      if (nav) {
+        port.post({ t: 'phase', phase: 'navigating' });
+        port.post({
+          t: 'navigator-open',
+          template: nav.template,
+          currentRecordId: nav.currentRecordId,
+          matchedKey: nav.matchedKey,
+          fillEntryId: nav.fillEntryId
+        });
+      }
     }
   }
 });
@@ -449,7 +497,7 @@ rpcHandle('submit-fill-plan', async () => {
 
 rpcHandle('get-profile', async () => {
   if (!Store.isUnlocked()) throw new Error('locked');
-  return (await Store.get('profile')) ?? { aliasMap: {}, canonicalData: {}, sensitiveKeys: [] };
+  return (await Store.get('profile')) ?? { aliasMap: {}, canonicalData: {}, sensitiveKeys: [], groupTemplates: [] };
 });
 
 rpcHandle('set-profile', async (req) => {
@@ -517,7 +565,7 @@ rpcHandle('parse-resume', async (req) => {
 rpcHandle('backup-export', async (req) => {
   if (!Store.isUnlocked()) throw new Error('locked');
   const profile =
-    (await Store.get('profile')) ?? { aliasMap: {}, canonicalData: {}, sensitiveKeys: [] };
+    (await Store.get('profile')) ?? { aliasMap: {}, canonicalData: {}, sensitiveKeys: [], groupTemplates: [] };
   const stories = (await Store.get('stories')) ?? [];
   const history = (await Store.get('history')) ?? [];
   const settings = (await Store.get('settings')) ?? DEFAULT_SETTINGS;
@@ -580,7 +628,7 @@ async function commitOnPage(
   try {
     const resp = (await chrome.tabs.sendMessage(
       tabId,
-      { __autofill_commit__: true, elementRef, fieldType, value },
+      { __quickfill_commit__: true, elementRef, fieldType, value },
       { frameId }
     )) as { ok: boolean; kind?: string; message?: string } | undefined;
     if (!resp) return { ok: false, kind: 'no-response', message: 'no response from content script' };
@@ -619,9 +667,20 @@ const session = new FillSessionImpl({
   broadcastPanel,
   pushActivity,
   removeActivity,
+  updateActivity,
+  loadRecordContext: async () => {
+    const { [SESSION_KEYS.recordContext]: v } = await chrome.storage.session.get(
+      SESSION_KEYS.recordContext
+    );
+    return (v as RecordContext | null | undefined) ?? null;
+  },
+  saveRecordContext: async (ctx) => {
+    if (ctx == null) await chrome.storage.session.remove(SESSION_KEYS.recordContext);
+    else await chrome.storage.session.set({ [SESSION_KEYS.recordContext]: ctx });
+  },
   loadSettings: async () => (await Store.get('settings')) ?? DEFAULT_SETTINGS,
   loadProfile: async () =>
-    (await Store.get('profile')) ?? ({ aliasMap: {}, canonicalData: {}, sensitiveKeys: [] } as Profile),
+    (await Store.get('profile')) ?? ({ aliasMap: {}, canonicalData: {}, sensitiveKeys: [], groupTemplates: [] } as Profile),
   saveProfile: async (p) => {
     await Store.set('profile', p);
     invalidateMatcherCache();
@@ -725,6 +784,10 @@ chrome.commands.onCommand.addListener((command, tab) => {
 
   logger.info('sw', `command fired: ${command}`, { tabId: tab?.id ?? null, url: tab?.url ?? null });
 
+  // NOTE: navigate-prev-record / navigate-next-record are no longer manifest
+  // commands. Navigation is handled by keydown listeners in the content script
+  // and side panel (see content/index.ts and sidepanel/Dashboard.svelte).
+
   // Open the side panel right away — it must be in the user gesture window.
   if (tab?.id != null && chrome.sidePanel?.open) {
     chrome.sidePanel.open({ tabId: tab.id }).catch((e) => {
@@ -780,7 +843,7 @@ chrome.commands.onCommand.addListener((command, tab) => {
       broadcastPanel({
         t: 'error',
         message:
-          "AutoFill couldn't talk to this page. If the URL is a chrome:// or chrome-extension:// page, AutoFill cannot run there. Otherwise, try reloading the page and pressing Alt+A again.",
+          "QuickFill couldn't talk to this page. If the URL is a chrome:// or chrome-extension:// page, QuickFill cannot run there. Otherwise, try reloading the page and pressing Alt+A again.",
         retryable: false
       });
       broadcastPanel({ t: 'phase', phase: 'cancelled' });
@@ -806,7 +869,7 @@ async function runCommandFallback(command: string): Promise<void> {
   if (!ok) {
     broadcastPanel({
       t: 'error',
-      message: "AutoFill couldn't talk to this page. Reload it, then press Alt+A again.",
+      message: "QuickFill couldn't talk to this page. Reload it, then press Alt+A again.",
       retryable: false
     });
     return;

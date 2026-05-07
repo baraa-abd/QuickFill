@@ -23,7 +23,12 @@ describe('Store (encrypted, end-to-end)', () => {
     expect(settings).toEqual(DEFAULT_SETTINGS);
 
     const profile = await Store.get('profile');
-    expect(profile).toEqual({ aliasMap: {}, canonicalData: {}, sensitiveKeys: [] });
+    expect(profile).toEqual({
+      aliasMap: {},
+      canonicalData: {},
+      sensitiveKeys: [],
+      groupTemplates: []
+    });
   });
 
   it('lock then unlock with the same password recovers data', async () => {

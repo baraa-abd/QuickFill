@@ -11,10 +11,41 @@ import {
   storySchema
 } from '../src/shared/schemas';
 import { DEFAULT_SETTINGS } from '../src/shared/constants';
+import type { Settings } from '../src/shared/types';
 
 describe('schemas round-trip', () => {
   it('settingsSchema accepts DEFAULT_SETTINGS', () => {
     expect(settingsSchema.safeParse(DEFAULT_SETTINGS).success).toBe(true);
+  });
+
+  it('settingsSchema back-fills detector defaults when the field is absent (backwards compat)', () => {
+    // Simulate a stored settings blob that pre-dates the detector field.
+    const old: Omit<Settings, 'detector'> = {
+      activeBackend: 'ollama',
+      backends: DEFAULT_SETTINGS.backends,
+      prompts: {},
+      promptParams: {},
+      matching: { fuseThreshold: 0.1 },
+      rag: { historyGenericKeyWeight: 0.3, minTokens: 1024, contextPercent: 25 },
+      dedup: { questionSimilarityThreshold: 0.85, genericKeySimilarityThreshold: 0.75 },
+      logging: { enabled: true, logPayloads: false, showDiagnostics: false },
+      session: { inactivityMinutes: 15 },
+      customContextWindows: {}
+    };
+    const result = settingsSchema.safeParse(old);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.detector).toEqual(DEFAULT_SETTINGS.detector);
+    }
+  });
+
+  it('settingsSchema back-fills detector defaults when the detector object is invalid', () => {
+    const bad = { ...DEFAULT_SETTINGS, detector: { maxAncestorHtml: 'not-a-number' } };
+    const result = settingsSchema.safeParse(bad);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.detector).toEqual(DEFAULT_SETTINGS.detector);
+    }
   });
 
   it('profileSchema accepts an empty profile', () => {

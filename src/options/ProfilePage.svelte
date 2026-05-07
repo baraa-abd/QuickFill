@@ -2,9 +2,15 @@
   import { onMount } from 'svelte';
   import { rpcCall } from '$bg/messaging';
   import { cleanLabel } from '$shared/clean';
-  import type { Profile, ProfileValue } from '$shared/types';
+  import type { GroupTemplate, Profile, ProfileValue } from '$shared/types';
+  import GroupTemplatesEditor from './GroupTemplatesEditor.svelte';
 
-  let profile: Profile = $state({ aliasMap: {}, canonicalData: {}, sensitiveKeys: [] });
+  let profile: Profile = $state({
+    aliasMap: {},
+    canonicalData: {},
+    sensitiveKeys: [],
+    groupTemplates: []
+  });
   let saving = $state(false);
   let saveMsg = $state('');
   let revealedKeys: Set<string> = $state(new Set());
@@ -18,7 +24,16 @@
 
   async function load() {
     const r = await rpcCall('get-profile', {});
-    if (r.ok) profile = structuredClone(r.value as Profile);
+    if (r.ok) {
+      const loaded = structuredClone(r.value as Profile);
+      // Defensive default: backups / older stored profiles may lack the field.
+      if (!Array.isArray(loaded.groupTemplates)) loaded.groupTemplates = [];
+      profile = loaded;
+    }
+  }
+
+  function setGroupTemplates(next: GroupTemplate[]) {
+    profile = { ...profile, groupTemplates: next };
   }
   onMount(load);
 
@@ -255,6 +270,8 @@
     </div>
   </div>
 {/each}
+
+<GroupTemplatesEditor {profile} onChange={setGroupTemplates} />
 
 <div class="card row" style="justify-content: flex-end; align-items: center;">
   {#if saveMsg}<span class="muted" style="margin-right: 12px;">{saveMsg}</span>{/if}

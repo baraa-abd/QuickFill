@@ -46,7 +46,7 @@ function getPipe(): Promise<EmbedFn> {
 // ───────────────────────── Message protocol ─────────────────────────
 
 type EmbedRequest = {
-  __autofill_offscreen__: true;
+  __quickfill_offscreen__: true;
   op: 'embed' | 'embed-batch' | 'warmup';
   text?: string;
   texts?: string[];
@@ -60,7 +60,7 @@ function isEmbedRequest(v: unknown): v is EmbedRequest {
   return (
     typeof v === 'object' &&
     v !== null &&
-    (v as { __autofill_offscreen__?: unknown }).__autofill_offscreen__ === true
+    (v as { __quickfill_offscreen__?: unknown }).__quickfill_offscreen__ === true
   );
 }
 

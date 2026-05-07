@@ -32,19 +32,38 @@ import type {
   AnswerHistoryEntry,
   FieldType,
   FillPlan,
+  GroupRecord,
+  GroupTemplate,
   Profile,
   Settings,
   Story
 } from '$shared/types';
-import { SENSITIVE_CANONICAL_KEYS } from '$shared/constants';
+import { DEFAULT_SETTINGS, SENSITIVE_CANONICAL_KEYS } from '$shared/constants';
 import { logger } from './logger';
 import { type ContentPort, type PortEvent } from './messaging';
-import { matchAlias, pickMatchingOption, appendValueDedup } from './matcher';
-import { classifyField } from './classifier';
+import {
+  appendValueDedup,
+  matchAlias,
+  matchTargets,
+  pickMatchingOption,
+  type MatchCandidate,
+  type MatchTarget
+} from './matcher';
+import { classifyField, type ClassifierResult } from './classifier';
 import { runChooser, resolveMaxLength, runStoryDiscovery, streamAnswer } from './llm/answer';
 import { deriveGenericKey } from './llm/generic-key';
+import { judgeAlias } from './llm/alias-judge';
 import { embed } from './rag/embeddings';
 import { ingest, applyUndo } from './history';
+
+/** Sticky group-template context, persisted in chrome.storage.session.
+ *  Cleared when a non-template fill happens or when the user explicitly
+ *  closes the navigator AND no further template-match has set it. */
+export type RecordContext = {
+  templateId: string;
+  recordId: string;
+  setAt: number;
+};
 
 // ───────────────────────── public types ─────────────────────────
 
@@ -70,6 +89,16 @@ export type FillActivity = {
   elementRef: string;
   previousValue: string;
   fieldType: FieldType;
+  // Set when the fill resolved through a group template — lets FillHistory
+  // surface "Work Experience #2 / job title" instead of just the bare key.
+  templateContext?: {
+    templateId: string;
+    templateName: string;
+    recordId: string;
+    /** 1-based index in the template's records list at fill time. */
+    recordIndex: number;
+    key: string;
+  };
 };
 
 /** A snapshot of a recent Alt+S save; the `previousProfile` snapshot lets
@@ -82,6 +111,16 @@ export type SaveActivity = {
   label: string;                // canonical key written
   value: string;
   previousProfile: Profile;     // snapshot taken just before the write
+  // Populated when the save targeted a group-template record. The Alt+S undo
+  // already snapshots the full profile so this is purely cosmetic — lets the
+  // SaveHistory card show "Work Experience #2 / job title".
+  templateContext?: {
+    templateId: string;
+    templateName: string;
+    recordId: string;
+    recordIndex: number;
+    key: string;
+  };
 };
 
 export type RecentActivity = FillActivity | SaveActivity;
@@ -114,6 +153,12 @@ export type FillSessionDeps = {
   pushActivity: (entry: RecentActivity) => void;
   /** Remove an entry from the ring buffer (after revert/delete). */
   removeActivity: (id: string) => void;
+  /** Replace an existing entry in place (used by the navigator when the user
+   *  switches records — the same form field is re-committed under the same id). */
+  updateActivity: (entry: RecentActivity) => void;
+  /** Sticky template+record selection across separate Alt+A invocations. */
+  loadRecordContext: () => Promise<RecordContext | null>;
+  saveRecordContext: (ctx: RecordContext | null) => Promise<void>;
 };
 
 // ───────────────────────── internals ─────────────────────────
@@ -128,12 +173,32 @@ type Phase =
   | 'story_setup'
   | 'answering'
   | 'committed'
-  | 'cancelled';
+  | 'cancelled'
+  | 'navigating';
+
+/**
+ * Fallback used until the user's settings have been loaded for the current
+ * session — see `start()` / `startWithManualHighlight()` for the async load
+ * that promotes the per-session ceiling to
+ * `Settings.session.inactivityMinutes`.
+ *
+ * The FillSession auto-aborts after this many milliseconds without any
+ * panel/content event. The timer is reset on every inbound port event (panel
+ * button, manual-highlight selection, content navigator key, panel keepalive
+ * heartbeat, …) so user activity holds the session open indefinitely.
+ */
+const DEFAULT_SESSION_INACTIVITY_MS = 15 * 60 * 1000;
 
 type State = {
   kind: FillKind;
   phase: Phase;
   abort: AbortController;
+  /** ReturnType<typeof setTimeout> portably typed across DOM/Node. */
+  inactivityTimer: ReturnType<typeof setTimeout> | null;
+  /** Resolved at session start from `Settings.session.inactivityMinutes`,
+   *  with `DEFAULT_SESSION_INACTIVITY_MS` as the fallback while the async
+   *  settings load is still in flight. */
+  inactivityMs: number;
 
   // Captured incrementally as the session progresses:
   plan: FillPlan | null;
@@ -158,10 +223,29 @@ type State = {
   // When true (Alt+Shift+A path), skip to manual_highlight regardless of
   // whether the detective found a question label.
   forceManualHighlight: boolean;
+
+  // Active group-template navigator (only set when phase === 'navigating').
+  navigator: NavigatorState | null;
+};
+
+type NavigatorState = {
+  /** Snapshot of the matched template at fill time. We snapshot so that
+   *  profile edits made mid-navigation don't shift the records out from under
+   *  the user; if they want fresh data, they can reopen the navigator with a
+   *  new Alt+A. */
+  template: GroupTemplate;
+  currentRecordId: string;
+  matchedKey: string;
+  /** id of the FillActivity entry to update in place when the user switches
+   *  records via Alt+] / Alt+[ / panel buttons. */
+  fillEntryId: string;
 };
 
 export class FillSessionImpl {
   private state: State | null = null;
+  /** Cached detector settings, updated asynchronously at session start.
+   *  Falls back to DEFAULT_SETTINGS.detector until the first load completes. */
+  private detectorSettings: Settings['detector'] = DEFAULT_SETTINGS.detector;
 
   constructor(private deps: FillSessionDeps) {}
 
@@ -193,6 +277,8 @@ export class FillSessionImpl {
       kind,
       phase: 'detecting',
       abort: new AbortController(),
+      inactivityTimer: null,
+      inactivityMs: DEFAULT_SESSION_INACTIVITY_MS,
       plan: null,
       resolvedQuestion: null,
       electedTabId: tabId,
@@ -202,11 +288,14 @@ export class FillSessionImpl {
       draftEditedByUser: false,
       maxLength: null,
       undoSnapshot: null,
-      forceManualHighlight: false
+      forceManualHighlight: false,
+      navigator: null
     };
     this.deps.broadcastPanel({ t: 'phase', phase: 'detecting' });
     this.deps.broadcastPanel({ t: 'status', message: 'Looking for the focused field…' });
-    for (const p of ports) p.post({ t: 'run-detective' });
+    for (const p of ports) p.post({ t: 'run-detective', detector: this.detectorSettings });
+    this.touchActivity();
+    void this.loadInactivityFromSettings();
 
     // No-response timeout. If no frame self-elects in DETECTIVE_TIMEOUT_MS,
     // surface a clear error.
@@ -246,6 +335,8 @@ export class FillSessionImpl {
       kind: 'fill',
       phase: 'detecting',
       abort: new AbortController(),
+      inactivityTimer: null,
+      inactivityMs: DEFAULT_SESSION_INACTIVITY_MS,
       plan: null,
       resolvedQuestion: null,
       electedTabId: tabId,
@@ -255,11 +346,14 @@ export class FillSessionImpl {
       draftEditedByUser: false,
       maxLength: null,
       undoSnapshot: null,
-      forceManualHighlight: true
+      forceManualHighlight: true,
+      navigator: null
     };
     this.deps.broadcastPanel({ t: 'phase', phase: 'detecting' });
     this.deps.broadcastPanel({ t: 'status', message: 'Connecting to the field…' });
-    for (const p of ports) p.post({ t: 'run-detective' });
+    for (const p of ports) p.post({ t: 'run-detective', detector: this.detectorSettings });
+    this.touchActivity();
+    void this.loadInactivityFromSettings();
 
     // Timeout: if no frame self-elects, still activate manual_highlight so
     // the user can drag-select the question (commit will fail gracefully
@@ -283,6 +377,7 @@ export class FillSessionImpl {
   abort(): void {
     if (!this.state) return;
     this.state.abort.abort();
+    if (this.state.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
     this.broadcastClose();
     this.deps.broadcastPanel({ t: 'phase', phase: 'cancelled' });
     this.deps.broadcastPanel({ t: 'close' });
@@ -290,10 +385,48 @@ export class FillSessionImpl {
     this.state = null;
   }
 
+  /** Reset the session-inactivity timer. Called on every inbound port event
+   *  (and on the panel-driven `keepalive` heartbeat). Fires `abort()` if no
+   *  activity arrives for `state.inactivityMs`. */
+  private touchActivity(): void {
+    if (!this.state) return;
+    if (this.state.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
+    this.state.inactivityTimer = setTimeout(() => {
+      if (!this.state) return;
+      logger.info('fill-session', 'inactivity timeout — aborting session');
+      this.deps.broadcastPanel({
+        t: 'status',
+        message: 'Session timed out due to inactivity.'
+      });
+      this.abort();
+    }, this.state.inactivityMs);
+  }
+
+  /** Pull `Settings.session.inactivityMinutes` and promote the running
+   *  session's ceiling. Called fire-and-forget right after a session starts;
+   *  errors (e.g. vault locked) are swallowed and the default stays in
+   *  effect. */
+  private async loadInactivityFromSettings(): Promise<void> {
+    try {
+      const s = await this.deps.loadSettings();
+      // Cache detector settings for the next session's run-detective broadcast.
+      if (s.detector) this.detectorSettings = s.detector;
+      const minutes = s.session?.inactivityMinutes;
+      if (typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes <= 0) return;
+      if (!this.state) return;
+      this.state.inactivityMs = Math.round(minutes * 60_000);
+      // Re-arm the timer with the freshly-loaded ceiling.
+      this.touchActivity();
+    } catch (e) {
+      logger.warn('fill-session', 'failed to load inactivity setting', { error: String(e) });
+    }
+  }
+
   /** Receive a port event from any content script in any frame. */
   async onContentEvent(ev: PortEvent, tabId: number, frameId: number): Promise<void> {
     if (!this.state) return;
     if (tabId !== this.state.electedTabId) return; // wrong tab — ignore
+    this.touchActivity();
 
     switch (ev.t) {
       case 'fill-plan': {
@@ -350,6 +483,16 @@ export class FillSessionImpl {
         await this.handleManualHighlightSubmit(ev.text);
         return;
       }
+      case 'navigator-prev':
+        // Content script forwards Alt+, when navigatorActive is set.
+        // Treat identically to the panel button — no frameId guard needed
+        // because only the elected frame ever receives navigator-active:true.
+        await this.navigateRecord(-1);
+        return;
+      case 'navigator-next':
+        // Content script forwards Alt+. when navigatorActive is set.
+        await this.navigateRecord(+1);
+        return;
       case 'abort': {
         this.abort();
         return;
@@ -367,11 +510,28 @@ export class FillSessionImpl {
         this.deps.broadcastPanel({ t: 'close' });
         return;
       }
-      if (ev.t !== 'revert-fill' && ev.t !== 'delete-save' && ev.t !== 'undo-merge') {
+      if (ev.t === 'keepalive') {
+        // No-op when no session — the panel sends these on a timer.
         return;
       }
+      // `confirm-story` is stateless: story discovery runs asynchronously
+      // after the fill session ends, so by the time the user clicks "Save
+      // story" in the panel, this.state is null. Don't drop it.
+      if (
+        ev.t !== 'revert-fill' &&
+        ev.t !== 'delete-save' &&
+        ev.t !== 'undo-merge' &&
+        ev.t !== 'confirm-story'
+      ) {
+        return;
+      }
+    } else {
+      this.touchActivity();
     }
     switch (ev.t) {
+      case 'keepalive':
+        // The touchActivity() above is the entire effect; nothing else to do.
+        return;
       case 'abort':
         this.abort();
         return;
@@ -402,14 +562,42 @@ export class FillSessionImpl {
       case 'delete-save':
         await this.handleDeleteSave(ev.id);
         return;
+      case 'navigator-next':
+        await this.navigateRecord(+1);
+        return;
+      case 'navigator-prev':
+        await this.navigateRecord(-1);
+        return;
+      case 'navigator-jump':
+        await this.navigateToRecord(ev.recordId);
+        return;
+      case 'navigator-close':
+        this.closeNavigator();
+        return;
       default:
         return;
     }
   }
 
+  // ───────────────────────── public helpers ─────────────────────────
+
+  /** True when a navigator is currently active. Used by the SW to route the
+   *  Alt+] / Alt+[ chrome.commands. */
+  isNavigating(): boolean {
+    return this.state?.phase === 'navigating' && this.state?.navigator != null;
+  }
+
+  /** A snapshot of the current navigator state — sent to a panel that
+   *  reconnects mid-navigation so the navigator card remounts seamlessly. */
+  getNavigatorSnapshot(): NavigatorState | null {
+    if (this.state?.phase !== 'navigating') return null;
+    return this.state.navigator;
+  }
+
   // ───────────────────────── workflow steps ─────────────────────────
 
   private endSession(): void {
+    if (this.state?.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
     this.broadcastClose();
     this.deps.broadcastPanel({ t: 'close' });
     this.state = null;
@@ -461,7 +649,7 @@ export class FillSessionImpl {
     const plan = this.state.plan;
     const label = this.state.resolvedQuestion;
 
-    // §4.2 direct match
+    // §4.2 direct match — extended to span flat keys + group templates.
     this.state.phase = 'matching';
     this.deps.broadcastPanel({ t: 'phase', phase: 'matching' });
     this.deps.broadcastPanel({
@@ -469,19 +657,22 @@ export class FillSessionImpl {
       message: `Checking your profile for "${label}"…`
     });
 
-    const hit = matchAlias(label, profile, settings.matching.fuseThreshold);
-    if (hit) {
-      const consumed = await this.tryAutoCommitFromProfile(
-        hit.canonicalKey,
+    const candidates = matchTargets(label, profile, settings.matching.fuseThreshold);
+
+    // Single unambiguous candidate → resolve directly without involving the LLM.
+    if (candidates.length === 1) {
+      const consumed = await this.applyResolvedTarget(
+        candidates[0].target,
+        'matcher',
         profile,
         plan,
-        settings,
-        'profile'
+        settings
       );
       if (consumed) return;
     }
 
-    // §4.3 classifier
+    // Zero or multiple candidates → §4.3 classifier with the candidate list
+    // (when present) so the LLM disambiguates instead of guessing fresh.
     this.state.phase = 'classifying';
     this.deps.broadcastPanel({ t: 'phase', phase: 'classifying' });
     this.deps.broadcastPanel({ t: 'status', message: 'Classifying field with the LLM…' });
@@ -492,8 +683,10 @@ export class FillSessionImpl {
       options: plan.options,
       profile,
       settings,
-      grandparentHtml: plan.grandparentHtml ?? null,
-      elementDescriptor: plan.elementDescriptor ?? ''
+      ancestorHtml: plan.ancestorHtml ?? null,
+      ancestorInnerText: plan.ancestorInnerText ?? null,
+      elementDescriptor: plan.elementDescriptor ?? '',
+      matchCandidates: candidates
     });
     if (!cl.ok) {
       this.deps.broadcastPanel({
@@ -503,21 +696,27 @@ export class FillSessionImpl {
       });
       return;
     }
-    const result = cl.result;
+    const result: ClassifierResult = cl.result;
     if (result.category === 'profile_existing_value') {
-      const consumed = await this.tryAutoCommitFromProfile(
-        result.canonicalKey,
+      const consumed = await this.applyResolvedTarget(
+        result.target,
+        'classifier',
         profile,
         plan,
-        settings,
-        'profile_existing_value'
+        settings
       );
       if (consumed) return;
       // Fell through (e.g. select with no good options) → story_answer fallback.
+      // Falling through to story_answer also clears any sticky template
+      // context — the user has effectively left the template flow.
+      await this.deps.saveRecordContext(null);
       await this.runStoryAnswer(plan, label, settings, profile);
       return;
     }
     if (result.category === 'profile_update') {
+      // profile_update is a flat-key suggestion, so any existing template
+      // context is no longer relevant — clear it.
+      await this.deps.saveRecordContext(null);
       this.state.phase = 'profile_update_pending';
       this.state.pendingUpdateKey = result.canonicalKey;
       this.deps.broadcastPanel({ t: 'phase', phase: 'profile_update_pending' });
@@ -531,7 +730,197 @@ export class FillSessionImpl {
       return;
     }
     // story_answer
+    await this.deps.saveRecordContext(null);
     await this.runStoryAnswer(plan, label, settings, profile);
+  }
+
+  /**
+   * Route a resolved match target (flat or template) to the right auto-commit
+   * path. Returns true when the session has been consumed (i.e. don't fall
+   * through to the next step). `origin` distinguishes which layer produced
+   * the target so the FillActivity source tag is accurate.
+   */
+  private async applyResolvedTarget(
+    target: MatchTarget,
+    origin: 'matcher' | 'classifier',
+    profile: Profile,
+    plan: FillPlan,
+    settings: Settings
+  ): Promise<boolean> {
+    if (!this.state) return false;
+    const labelForAlias = this.state.resolvedQuestion ?? '';
+    let consumed: boolean;
+    if (target.kind === 'flat') {
+      const source: FillActivity['source'] =
+        origin === 'matcher' ? 'profile' : 'profile_existing_value';
+      // Flat-key fills clear any sticky template context — the user has moved
+      // out of the template (per the design: sticky persists until a non-
+      // template fill happens).
+      await this.deps.saveRecordContext(null);
+      consumed = await this.tryAutoCommitFromProfile(
+        target.canonicalKey,
+        profile,
+        plan,
+        settings,
+        source
+      );
+    } else {
+      consumed = await this.tryAutoCommitFromTemplate(target, profile, plan, settings, origin);
+    }
+    // Classifier-resolved matches sometimes pulled the canonical via surrounding
+    // HTML rather than a true label↔key alias. Ask a narrow LLM judge whether
+    // the observed label is a genuine alias and, if so, persist it for future
+    // direct-matching. Fire-and-forget — never blocks the commit.
+    if (consumed && origin === 'classifier' && labelForAlias.trim()) {
+      void this.maybeRecordAlias(target, labelForAlias, plan.ancestorHtml ?? null, settings);
+    }
+    return consumed;
+  }
+
+  /**
+   * Run the alias-judge LLM and, on `isAlias: true`, persist the new alias
+   * back to the profile. Tolerates concurrent profile edits — re-loads the
+   * profile before writing. Errors are logged but never surfaced to the user
+   * (this is a background optimization, not a user-visible action).
+   */
+  private async maybeRecordAlias(
+    target: MatchTarget,
+    rawLabel: string,
+    ancestorHtml: string | null,
+    settings: Settings
+  ): Promise<void> {
+    try {
+      const cleanedLabel = cleanLabel(rawLabel);
+      if (!cleanedLabel) return;
+
+      // Identity short-circuit: if the cleaned label IS the canonical key,
+      // nothing to add (aliasMap already carries (K → K)).
+      if (target.kind === 'flat' && cleanedLabel === target.canonicalKey) return;
+      if (target.kind === 'template' && cleanedLabel === target.key) return;
+
+      // Already-known short-circuit: avoid the LLM call when the alias is
+      // already mapped to the same target.
+      const probe = await this.deps.loadProfile();
+      if (target.kind === 'flat') {
+        if (probe.aliasMap[cleanedLabel] === target.canonicalKey) return;
+      } else {
+        const tpl = (probe.groupTemplates ?? []).find((t) => t.id === target.templateId);
+        const keyDef = tpl?.keys.find((k) => k.key === target.key);
+        if (keyDef && keyDef.aliases.some((a) => cleanLabel(a) === cleanedLabel)) return;
+      }
+
+      const canonicalForJudge =
+        target.kind === 'flat' ? target.canonicalKey : `${target.templateName} / ${target.key}`;
+      const r = await judgeAlias(settings, {
+        canonicalKey: canonicalForJudge,
+        fieldLabel: rawLabel,
+        ancestorHtml
+      });
+      if (!r.ok) {
+        logger.warn('alias-judge', 'failed', { error: r.message });
+        return;
+      }
+      if (!r.isAlias) return;
+
+      // Re-load to merge against the freshest profile snapshot.
+      const profile = await this.deps.loadProfile();
+      let next: Profile;
+      if (target.kind === 'flat') {
+        if (!(target.canonicalKey in profile.canonicalData)) return;
+        if (profile.aliasMap[cleanedLabel] === target.canonicalKey) return;
+        next = {
+          ...profile,
+          aliasMap: { ...profile.aliasMap, [cleanedLabel]: target.canonicalKey }
+        };
+      } else {
+        const tplIdx = (profile.groupTemplates ?? []).findIndex((t) => t.id === target.templateId);
+        if (tplIdx < 0) return;
+        const cloned = structuredClone(profile);
+        const tpl = cloned.groupTemplates[tplIdx];
+        const keyDef = tpl.keys.find((k) => k.key === target.key);
+        if (!keyDef) return;
+        if (keyDef.aliases.some((a) => cleanLabel(a) === cleanedLabel)) return;
+        keyDef.aliases = [...keyDef.aliases, cleanedLabel];
+        tpl.updatedAt = Date.now();
+        next = cloned;
+      }
+      await this.deps.saveProfile(next);
+      const canonicalDisplay =
+        target.kind === 'flat' ? target.canonicalKey : `${target.templateName} / ${target.key}`;
+      logger.info('alias-judge', 'alias recorded', {
+        target: canonicalDisplay,
+        alias: cleanedLabel
+      });
+      // Surface a transient toast in the side panel with a "Delete alias"
+      // button — see §4.3 (alias-judge follow-up). The panel auto-dismisses
+      // after a few seconds; the user can revert if the judge got it wrong.
+      this.deps.broadcastPanel({
+        t: 'alias-added',
+        id: uuid(),
+        alias: cleanedLabel,
+        canonicalDisplay,
+        target
+      });
+    } catch (e) {
+      logger.warn('alias-judge', 'threw', { error: String(e) });
+    }
+  }
+
+  /**
+   * Public helper called by the SW when the panel posts `delete-alias` (the
+   * user clicked the toast's "Delete alias" button). Removes the alias from
+   * the freshest profile snapshot. Tolerates the alias having already been
+   * removed; logs but never surfaces errors.
+   */
+  async deleteAliasEntry(args: {
+    id: string;
+    alias: string;
+    target: MatchTarget;
+  }): Promise<void> {
+    try {
+      const cleaned = cleanLabel(args.alias);
+      if (!cleaned) return;
+      const profile = await this.deps.loadProfile();
+      let next: Profile | null = null;
+      if (args.target.kind === 'flat') {
+        if (profile.aliasMap[cleaned] !== args.target.canonicalKey) return;
+        const aliasMap = { ...profile.aliasMap };
+        delete aliasMap[cleaned];
+        next = { ...profile, aliasMap };
+      } else {
+        const tplIdx = (profile.groupTemplates ?? []).findIndex(
+          (t) => t.id === (args.target as Extract<MatchTarget, { kind: 'template' }>).templateId
+        );
+        if (tplIdx < 0) return;
+        const cloned = structuredClone(profile);
+        const tpl = cloned.groupTemplates[tplIdx];
+        const targetKey = (args.target as Extract<MatchTarget, { kind: 'template' }>).key;
+        const keyDef = tpl.keys.find((k) => k.key === targetKey);
+        if (!keyDef) return;
+        const before = keyDef.aliases.length;
+        keyDef.aliases = keyDef.aliases.filter((a) => cleanLabel(a) !== cleaned);
+        if (keyDef.aliases.length === before) return;
+        tpl.updatedAt = Date.now();
+        next = cloned;
+      }
+      if (next) {
+        await this.deps.saveProfile(next);
+        logger.info('alias-judge', 'alias deleted by user', {
+          target:
+            args.target.kind === 'flat'
+              ? args.target.canonicalKey
+              : `${args.target.templateName}/${args.target.key}`,
+          alias: cleaned
+        });
+      }
+      this.deps.broadcastPanel({ t: 'alias-toast-remove', id: args.id });
+      this.deps.broadcastPanel({
+        t: 'status',
+        message: `Removed alias "${cleaned}".`
+      });
+    } catch (e) {
+      logger.warn('alias-judge', 'delete failed', { error: String(e) });
+    }
   }
 
   /**
@@ -597,8 +986,295 @@ export class FillSessionImpl {
     // Auto-commit complete — close the session and signal the panel.
     this.deps.broadcastPanel({ t: 'phase', phase: 'committed' });
     this.deps.broadcastPanel({ t: 'status', message: 'Filled from profile.' });
+    if (this.state?.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
     this.state = null;
     return true;
+  }
+
+  /**
+   * Auto-commit a value from a group-template record. Picks the record per
+   * the sticky-context rule (first template fill = default record; subsequent
+   * fills inside the same template = whatever was last shown). After commit,
+   * enters `navigating` phase so the user can switch records via Alt+] /
+   * Alt+[ or the panel buttons.
+   *
+   * Returns false if the template / record / value combination yields no
+   * usable value (template has no records, key missing, select with no
+   * matching option) so the caller can fall through to story_answer.
+   */
+  private async tryAutoCommitFromTemplate(
+    target: Extract<MatchTarget, { kind: 'template' }>,
+    profile: Profile,
+    plan: FillPlan,
+    settings: Settings,
+    origin: 'matcher' | 'classifier'
+  ): Promise<boolean> {
+    if (!this.state) return false;
+    const tpl = (profile.groupTemplates ?? []).find((t) => t.id === target.templateId);
+    if (!tpl) return false;
+    if (tpl.records.length === 0) return false;
+
+    // Sticky-context rule.
+    const sticky = await this.deps.loadRecordContext();
+    let recordId: string | null = null;
+    if (sticky && sticky.templateId === tpl.id) {
+      // Same template as last template fill → reuse last record (if it still exists).
+      if (tpl.records.some((r) => r.id === sticky.recordId)) {
+        recordId = sticky.recordId;
+      }
+    }
+    if (recordId == null) {
+      // First fill into this template (or sticky pointed at a deleted record).
+      // Fall back to the configured default; if that's missing too, take the
+      // first record.
+      if (tpl.defaultRecordId && tpl.records.some((r) => r.id === tpl.defaultRecordId)) {
+        recordId = tpl.defaultRecordId;
+      } else {
+        recordId = tpl.records[0].id;
+      }
+    }
+
+    const record = tpl.records.find((r) => r.id === recordId);
+    if (!record) return false;
+
+    // Resolve the value for the matched key, coerced for the field type.
+    const resolved = resolveTemplateValueForField(tpl, record, target.key, plan, settings);
+    if (resolved == null) return false;
+
+    const recordIndex = tpl.records.findIndex((r) => r.id === recordId) + 1;
+    const fillEntry = await this.commitTemplateValue({
+      template: tpl,
+      record,
+      matchedKey: target.key,
+      value: resolved,
+      plan,
+      origin
+    });
+    if (!fillEntry) return false;
+
+    // Persist sticky context for cross-Alt+A continuity.
+    await this.deps.saveRecordContext({
+      templateId: tpl.id,
+      recordId: record.id,
+      setAt: Date.now()
+    });
+
+    // Enter navigating phase. Snapshot the template so subsequent
+    // navigateRecord calls iterate over a stable list even if the user edits
+    // the profile in another tab mid-session.
+    this.state.phase = 'navigating';
+    this.state.navigator = {
+      template: structuredClone(tpl),
+      currentRecordId: record.id,
+      matchedKey: target.key,
+      fillEntryId: fillEntry.id
+    };
+
+    // Tell the elected content script to start intercepting Alt+, / Alt+.
+    // We use getContentPort (targeted) rather than getAllContentPorts
+    // (broadcast) so only the frame that owns the filled element intercepts
+    // the keys — other frames on the same page are unaffected.
+    if (this.state.electedFrameId != null) {
+      this.deps.getContentPort(this.state.electedTabId, this.state.electedFrameId)
+        ?.post({
+          t: 'navigator-active',
+          active: true,
+          prevKey: settings.navigator.prevKey,
+          nextKey: settings.navigator.nextKey
+        });
+    }
+
+    this.deps.broadcastPanel({ t: 'phase', phase: 'navigating' });
+    this.deps.broadcastPanel({
+      t: 'navigator-open',
+      template: this.state.navigator.template,
+      currentRecordId: record.id,
+      matchedKey: target.key,
+      fillEntryId: fillEntry.id
+    });
+    this.deps.broadcastPanel({
+      t: 'status',
+      message: `Filled from "${tpl.name}" record ${recordIndex}/${tpl.records.length}.`
+    });
+    return true;
+  }
+
+  /**
+   * Commit a template-derived value to the page and push a FillActivity entry
+   * with templateContext. Shared between the initial auto-commit and the
+   * navigator's record-switching path.
+   */
+  private async commitTemplateValue(args: {
+    template: GroupTemplate;
+    record: GroupRecord;
+    matchedKey: string;
+    value: string;
+    plan: FillPlan;
+    origin: 'matcher' | 'classifier';
+  }): Promise<FillActivity | null> {
+    const { template, record, matchedKey, value, plan, origin } = args;
+    const recordIndex = template.records.findIndex((r) => r.id === record.id) + 1;
+    const previousValue = plan.currentValue;
+    let supportedField = plan.fieldType !== 'unknown';
+    let committed: { ok: boolean; kind?: string; message?: string } = { ok: false };
+    if (supportedField) {
+      committed = await this.deps.commitOnPage(
+        plan.tabId,
+        plan.frameId,
+        plan.elementRef,
+        plan.fieldType,
+        value
+      );
+      if (!committed.ok) {
+        if (committed.kind === 'detached') {
+          this.deps.broadcastPanel({
+            t: 'error',
+            message: 'The field disappeared from the page before we could fill it.',
+            retryable: false
+          });
+          this.endSession();
+          return null;
+        }
+        supportedField = false;
+      }
+    }
+    if (!supportedField) {
+      this.deps.broadcastPanel({
+        t: 'error',
+        message: `This field type isn't supported yet. Copy the value from the recent fills below.`,
+        retryable: false
+      });
+    }
+    const entry: FillActivity = {
+      kind: 'fill',
+      id: uuid(),
+      at: Date.now(),
+      label: this.state?.resolvedQuestion ?? matchedKey,
+      canonicalKey: matchedKey,
+      value,
+      source: origin === 'matcher' ? 'profile' : 'profile_existing_value',
+      alternativeValues: [],
+      tabId: plan.tabId,
+      frameId: plan.frameId,
+      elementRef: plan.elementRef,
+      previousValue,
+      fieldType: plan.fieldType,
+      templateContext: {
+        templateId: template.id,
+        templateName: template.name,
+        recordId: record.id,
+        recordIndex,
+        key: matchedKey
+      }
+    };
+    this.deps.pushActivity(entry);
+    this.deps.broadcastPanel({ t: 'recent-activity-add', entry });
+    return entry;
+  }
+
+  // ───────────────────────── Navigator (Alt+] / Alt+[ / panel buttons) ─────────────────────────
+
+  private async navigateRecord(delta: 1 | -1): Promise<void> {
+    if (!this.state || this.state.phase !== 'navigating' || !this.state.navigator) return;
+    const nav = this.state.navigator;
+    const records = nav.template.records;
+    if (records.length <= 1) {
+      this.deps.broadcastPanel({
+        t: 'status',
+        message: 'This template has only one record — nothing to switch to.'
+      });
+      return;
+    }
+    const idx = records.findIndex((r) => r.id === nav.currentRecordId);
+    if (idx < 0) return;
+    const nextIdx = (idx + delta + records.length) % records.length;
+    await this.navigateToRecord(records[nextIdx].id);
+  }
+
+  private async navigateToRecord(recordId: string): Promise<void> {
+    if (!this.state || this.state.phase !== 'navigating' || !this.state.navigator) return;
+    const nav = this.state.navigator;
+    const tpl = nav.template;
+    const record = tpl.records.find((r) => r.id === recordId);
+    if (!record || record.id === nav.currentRecordId) return;
+    if (!this.state.plan) return;
+
+    const settings = await this.deps.loadSettings();
+    const resolved = resolveTemplateValueForField(tpl, record, nav.matchedKey, this.state.plan, settings);
+    if (resolved == null) {
+      this.deps.broadcastPanel({
+        t: 'status',
+        message: `Record has no value for "${nav.matchedKey}" — clearing the field.`
+      });
+    }
+    const valueToCommit = resolved ?? '';
+    const r = await this.deps.commitOnPage(
+      this.state.plan.tabId,
+      this.state.plan.frameId,
+      this.state.plan.elementRef,
+      this.state.plan.fieldType,
+      valueToCommit
+    );
+    if (!r.ok) {
+      this.deps.broadcastPanel({
+        t: 'error',
+        message: `Couldn't switch records: ${r.message ?? r.kind ?? 'commit failed'}.`,
+        retryable: false
+      });
+      return;
+    }
+
+    // Update navigator state, sticky context, and the in-place activity entry.
+    nav.currentRecordId = record.id;
+    await this.deps.saveRecordContext({
+      templateId: tpl.id,
+      recordId: record.id,
+      setAt: Date.now()
+    });
+
+    const recordIndex = tpl.records.findIndex((r) => r.id === record.id) + 1;
+    const updated: FillActivity = {
+      kind: 'fill',
+      id: nav.fillEntryId,
+      at: Date.now(),
+      label: this.state.resolvedQuestion ?? nav.matchedKey,
+      canonicalKey: nav.matchedKey,
+      value: valueToCommit,
+      source: 'profile',
+      alternativeValues: [],
+      tabId: this.state.plan.tabId,
+      frameId: this.state.plan.frameId,
+      elementRef: this.state.plan.elementRef,
+      previousValue: '', // overwritten below — preserved from the original entry
+      fieldType: this.state.plan.fieldType,
+      templateContext: {
+        templateId: tpl.id,
+        templateName: tpl.name,
+        recordId: record.id,
+        recordIndex,
+        key: nav.matchedKey
+      }
+    };
+    // Preserve the original previousValue (true pre-fill state) by reading the
+    // existing entry. Activity buffer is owned by the SW caller; we ask it to
+    // patch in place via updateActivity, which is also responsible for keeping
+    // previousValue intact. So pass through here and the caller does the
+    // merge.
+    this.deps.updateActivity(updated);
+    this.deps.broadcastPanel({ t: 'navigator-update', currentRecordId: record.id });
+    this.deps.broadcastPanel({
+      t: 'status',
+      message: `Switched to record ${recordIndex}/${tpl.records.length}.`
+    });
+  }
+
+  private closeNavigator(): void {
+    if (!this.state || this.state.phase !== 'navigating') return;
+    if (this.state.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
+    this.broadcastClose();
+    this.deps.broadcastPanel({ t: 'navigator-close-broadcast' });
+    this.deps.broadcastPanel({ t: 'close' });
+    this.state = null;
   }
 
   private async runStoryAnswer(
@@ -767,6 +1443,7 @@ export class FillSessionImpl {
     this.state.phase = 'committed';
     this.deps.broadcastPanel({ t: 'phase', phase: 'committed' });
     this.deps.broadcastPanel({ t: 'status', message: 'Saved.' });
+    if (this.state.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
     this.state = null;
   }
 
@@ -849,6 +1526,7 @@ export class FillSessionImpl {
     this.state.phase = 'committed';
     this.deps.broadcastPanel({ t: 'phase', phase: 'committed' });
     this.deps.broadcastPanel({ t: 'status', message: 'Saved to profile and filled.' });
+    if (this.state.inactivityTimer != null) clearTimeout(this.state.inactivityTimer);
     this.state = null;
   }
 
@@ -909,6 +1587,40 @@ export class FillSessionImpl {
     const profileBefore = await this.deps.loadProfile();
     const settings = await this.deps.loadSettings();
 
+    // Group-template integration: if the cleaned label matches a template key
+    // AND there's a sticky context for the SAME template, route the save into
+    // that record's slot. Otherwise behave as before (flat profile write).
+    const sticky = await this.deps.loadRecordContext();
+    const candidates = matchTargets(cleaned, profileBefore, settings.matching.fuseThreshold);
+    const templateCandidate = candidates.find(
+      (c): c is MatchCandidate & { target: Extract<MatchTarget, { kind: 'template' }> } =>
+        c.target.kind === 'template' &&
+        sticky != null &&
+        c.target.templateId === sticky.templateId
+    );
+
+    if (templateCandidate && sticky) {
+      const tplIdx = (profileBefore.groupTemplates ?? []).findIndex(
+        (t) => t.id === sticky.templateId
+      );
+      if (tplIdx >= 0) {
+        const tpl = profileBefore.groupTemplates[tplIdx];
+        const recIdx = tpl.records.findIndex((r) => r.id === sticky.recordId);
+        if (recIdx >= 0) {
+          await this.saveToTemplateRecord({
+            profileBefore,
+            templateIndex: tplIdx,
+            recordIndex: recIdx,
+            key: templateCandidate.target.key,
+            value,
+            sensitive
+          });
+          return;
+        }
+      }
+    }
+
+    // Flat-profile path (default).
     const hit = matchAlias(cleaned, profileBefore, settings.matching.fuseThreshold);
     let next: Profile;
     let writeKey: string;
@@ -947,6 +1659,69 @@ export class FillSessionImpl {
     this.deps.broadcastPanel({
       t: 'status',
       message: `Saved to profile under "${writeKey}".`
+    });
+    this.endSession();
+  }
+
+  /**
+   * Write a value into one slot of one record of one template, then push a
+   * SaveActivity that snapshots the full pre-save profile (so delete reverts
+   * cleanly). Honors the per-key `array` type by appending instead of
+   * overwriting when the existing slot is already a string[].
+   */
+  private async saveToTemplateRecord(args: {
+    profileBefore: Profile;
+    templateIndex: number;
+    recordIndex: number;
+    key: string;
+    value: string;
+    sensitive: boolean;
+  }): Promise<void> {
+    if (!this.state) return;
+    const { profileBefore, templateIndex, recordIndex, key, value, sensitive } = args;
+    const next = structuredClone(profileBefore);
+    const tpl = next.groupTemplates[templateIndex];
+    const record = tpl.records[recordIndex];
+    const keyDef = tpl.keys.find((k) => k.key === key);
+    const now = Date.now();
+    if (keyDef?.type === 'array') {
+      const existing = record.values[key];
+      const arr = Array.isArray(existing) ? existing.slice() : existing ? [String(existing)] : [];
+      const trimmed = value.trim();
+      if (trimmed && !arr.some((v) => v.trim().toLowerCase() === trimmed.toLowerCase())) {
+        arr.push(value);
+      }
+      record.values[key] = arr;
+    } else {
+      record.values[key] = value;
+    }
+    record.updatedAt = now;
+    if (sensitive && keyDef && !keyDef.sensitive) {
+      keyDef.sensitive = true;
+    }
+    tpl.updatedAt = now;
+    await this.deps.saveProfile(next);
+
+    const entry: SaveActivity = {
+      kind: 'save',
+      id: uuid(),
+      at: Date.now(),
+      label: `${tpl.name} #${recordIndex + 1} / ${key}`,
+      value,
+      previousProfile: profileBefore,
+      templateContext: {
+        templateId: tpl.id,
+        templateName: tpl.name,
+        recordId: record.id,
+        recordIndex: recordIndex + 1,
+        key
+      }
+    };
+    this.deps.pushActivity(entry);
+    this.deps.broadcastPanel({ t: 'recent-activity-add', entry });
+    this.deps.broadcastPanel({
+      t: 'status',
+      message: `Saved to "${tpl.name}" record ${recordIndex + 1} → ${key}.`
     });
     this.endSession();
   }
@@ -1122,7 +1897,7 @@ function upsertProfile(
   if (sensitive || SENSITIVE_CANONICAL_KEYS.includes(canonicalKey)) {
     if (!sensitiveKeys.includes(canonicalKey)) sensitiveKeys = [...sensitiveKeys, canonicalKey];
   }
-  return { aliasMap, canonicalData, sensitiveKeys };
+  return { aliasMap, canonicalData, sensitiveKeys, groupTemplates: profile.groupTemplates ?? [] };
 }
 
 function uuid(): string {
@@ -1132,6 +1907,61 @@ function uuid(): string {
 
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+/**
+ * Resolve a record's value for one matched key into a string suitable for
+ * commit. Returns null when no commit-able value is available (missing key,
+ * empty array, select with no acceptable option). The caller decides whether
+ * to fall through (fresh fill) or commit empty (record switch).
+ *
+ * Coercion rules:
+ *   - boolean type     → "yes" / "no" for text-y fields; checkbox fields use
+ *                        the same string but the commit layer interprets
+ *                        "yes/true/1/checked" as checked.
+ *   - array type       → joined with newlines for text/textarea/contenteditable;
+ *                        first element for select/radio after fuzzy match;
+ *                        joined with comma for unknown.
+ *   - select/radio     → fuzzy-pick from options against the resolved string(s).
+ *   - everything else  → string coerced to string.
+ */
+function resolveTemplateValueForField(
+  template: GroupTemplate,
+  record: GroupRecord,
+  matchedKey: string,
+  plan: FillPlan,
+  settings: Settings
+): string | null {
+  const keyDef = template.keys.find((k) => k.key === matchedKey);
+  const raw = record.values[matchedKey];
+  if (raw == null || raw === '') return null;
+
+  // Normalize to string[] for array handling.
+  const asArray: string[] = Array.isArray(raw)
+    ? raw.filter((v) => v != null && v !== '').map(String)
+    : [String(raw)];
+  if (asArray.length === 0) return null;
+
+  if (plan.fieldType === 'select' || plan.fieldType === 'radio') {
+    if (!plan.options || plan.options.length === 0) return null;
+    const picked = pickMatchingOption(asArray, plan.options, settings.matching.fuseThreshold);
+    return picked;
+  }
+  if (plan.fieldType === 'checkbox') {
+    return asArray[0];
+  }
+  if (keyDef?.type === 'boolean') {
+    const v = asArray[0].trim().toLowerCase();
+    const truthy = v === 'yes' || v === 'true' || v === '1' || v === 'checked';
+    return truthy ? 'yes' : 'no';
+  }
+  if (keyDef?.type === 'array' || asArray.length > 1) {
+    if (plan.fieldType === 'textarea' || plan.fieldType === 'contenteditable') {
+      return asArray.join('\n');
+    }
+    return asArray.join(', ');
+  }
+  return asArray[0];
 }
 
 void z; // reserved for inline schema use; suppress unused-import lint

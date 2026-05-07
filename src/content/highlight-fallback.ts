@@ -2,9 +2,9 @@
 //
 // Active in the focused frame only. Shows a tooltip near the cursor; reads
 // `window.getSelection()` on selectionchange / mouseup; Enter submits, Esc
-// cancels. Times out after 1 minute of inactivity.
+// cancels. Times out after several minutes of inactivity.
 
-const TOOLTIP_ID = '__autofill_highlight_tip__';
+const TOOLTIP_ID = '__quickfill_highlight_tip__';
 const INACTIVITY_MS = 60_000;
 
 type Listeners = {

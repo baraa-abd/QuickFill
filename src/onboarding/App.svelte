@@ -41,8 +41,6 @@
   let resumeText = $state('');
   let resumeError = $state('');
   let resumeBusy = $state(false);
-  let parsedProfile: Profile | null = $state(null);
-  let parsedStories: Story[] = $state([]);
 
   // review step — editable profile + stories.
   let reviewProfile: Profile | null = $state(null);
@@ -176,8 +174,6 @@
       // structuredClone doesn't receive a reactive proxy (which can't be cloned).
       const rawProfile = r.value.profile;
       const rawStories = r.value.stories;
-      parsedProfile = rawProfile;
-      parsedStories = rawStories;
       reviewProfile = structuredClone(rawProfile);
       reviewStories = structuredClone(rawStories);
       step = 'review';
@@ -273,7 +269,7 @@
 </script>
 
 <header class="row" style="justify-content: space-between;">
-  <h1>AutoFill — Setup</h1>
+  <h1>QuickFill — Setup</h1>
   <span class="step-label">{step}</span>
 </header>
 
@@ -281,7 +277,7 @@
   <div class="card col">
     <h2>Welcome</h2>
     <p>
-      AutoFill is a user-centric job-application auto-fill extension. Press
+      QuickFill is a user-centric job-application auto-fill extension. Press
       <span class="kbd">Alt</span> + <span class="kbd">A</span> on a form
       field to start a fill; press <span class="kbd">Esc</span> to cancel.
       Nothing happens automatically.

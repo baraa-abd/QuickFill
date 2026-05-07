@@ -71,7 +71,13 @@ export default defineManifest({
     'add-to-profile': {
       suggested_key: { default: 'Alt+S' },
       description: "Save the focused field's current value to the profile"
-    }
+    },
+    // navigate-prev-record / navigate-next-record were removed from manifest
+    // commands because Chrome MV3 only allows 4 user-defined keyboard shortcuts
+    // per extension. Navigation is now handled by keydown listeners in the
+    // content script (when the page has focus) and in the side panel (when the
+    // panel has focus). Both listen for Alt+, and Alt+. and route them through
+    // the existing port infrastructure.
   },
 
   // The offscreen document needs to be loadable by URL from the SW.

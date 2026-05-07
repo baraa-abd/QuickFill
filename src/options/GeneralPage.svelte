@@ -44,6 +44,12 @@
   function resetDedup(field: keyof Settings['dedup']) {
     settings.dedup[field] = DEFAULT_SETTINGS.dedup[field];
   }
+  function resetSession(field: keyof Settings['session']) {
+    settings.session[field] = DEFAULT_SETTINGS.session[field];
+  }
+  function resetDetector(field: keyof Settings['detector']) {
+    settings.detector[field] = DEFAULT_SETTINGS.detector[field];
+  }
 
   function addCustomCw() {
     const m = customCwModel.trim();
@@ -70,6 +76,25 @@
     chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
   }
 
+  // Single-character validation for the navigator key inputs. Strips Alt
+  // accidentally typed by the user (since the modifier is fixed) and rejects
+  // alphanumerics that would collide with other Alt+letter chrome.commands.
+  function sanitizeNavKey(raw: string): string {
+    const c = raw.trim().slice(0, 1);
+    return c.length === 1 ? c : '';
+  }
+  function setPrevKey(raw: string) {
+    const k = sanitizeNavKey(raw);
+    if (k) settings.navigator.prevKey = k;
+  }
+  function setNextKey(raw: string) {
+    const k = sanitizeNavKey(raw);
+    if (k) settings.navigator.nextKey = k;
+  }
+  function resetNavigator() {
+    settings.navigator = structuredClone(DEFAULT_SETTINGS.navigator);
+  }
+
   // Re-emit the locked event from inside the closure if/when needed (currently
   // not wired into any control on this page). The eager reference suppresses
   // svelte's "captures only initial value" warning.
@@ -81,17 +106,58 @@
 <div class="card col">
   <h2>Shortcuts</h2>
   <p class="muted">
-    AutoFill uses <span class="kbd">Alt</span>+<span class="kbd">A</span> to start a fill and
-    <span class="kbd">Alt</span>+<span class="kbd">S</span> to save the focused field. Rebind from
-    Chrome's shortcut page.
+    QuickFill uses
+    <span class="kbd">Alt</span>+<span class="kbd">A</span> to start a fill,
+    <span class="kbd">Alt</span>+<span class="kbd">Shift</span>+<span class="kbd">A</span>
+    to start with manual question highlighting, and
+    <span class="kbd">Alt</span>+<span class="kbd">S</span> to save the focused field to your
+    profile. Rebind these on Chrome's shortcut page.
   </p>
+  <p class="muted">
+    When stepping through group-template records,
+    <span class="kbd">Alt</span>+<span class="kbd">{settings.navigator.prevKey}</span>
+    moves to the previous record and
+    <span class="kbd">Alt</span>+<span class="kbd">{settings.navigator.nextKey}</span>
+    moves to the next. These are not Chrome commands (the manifest is at the 4-shortcut cap), so
+    they're rebound here:
+  </p>
+  <fieldset>
+    <legend>Record navigator keys (Alt + …)</legend>
+    <label class="row">
+      <span style="flex: 1;">Previous record (default {DEFAULT_SETTINGS.navigator.prevKey})</span>
+      <input
+        type="text"
+        maxlength="1"
+        size="2"
+        value={settings.navigator.prevKey}
+        oninput={(e) => setPrevKey((e.currentTarget as HTMLInputElement).value)}
+      />
+    </label>
+    <label class="row">
+      <span style="flex: 1;">Next record (default {DEFAULT_SETTINGS.navigator.nextKey})</span>
+      <input
+        type="text"
+        maxlength="1"
+        size="2"
+        value={settings.navigator.nextKey}
+        oninput={(e) => setNextKey((e.currentTarget as HTMLInputElement).value)}
+      />
+    </label>
+    <div class="row" style="justify-content: flex-end; gap: 8px;">
+      <button type="button" onclick={resetNavigator}>Reset</button>
+      <button class="primary" type="button" onclick={save} disabled={saving}>
+        {saving ? 'Saving…' : 'Save'}
+      </button>
+      {#if saveMsg}<span class="muted">{saveMsg}</span>{/if}
+    </div>
+  </fieldset>
   <div class="row" style="justify-content: flex-end;">
     <button onclick={shortcuts} type="button">Open chrome://extensions/shortcuts</button>
   </div>
 </div>
 
 <div class="card col">
-  <h2>Advanced thresholds</h2>
+  <h2>Advanced parameters</h2>
   <button onclick={() => (advancedOpen = !advancedOpen)} type="button">
     {advancedOpen ? 'Hide' : 'Show'} advanced
   </button>
@@ -169,6 +235,90 @@
     </fieldset>
 
     <fieldset>
+      <legend>Session</legend>
+      <label class="row">
+        <span style="flex: 1;">
+          Inactivity timeout, minutes (default {DEFAULT_SETTINGS.session.inactivityMinutes}). The
+          fill session auto-closes after this many minutes without any panel or page interaction;
+          clicks, typing in the draft, and the panel keepalive heartbeat all reset the timer.
+        </span>
+        <input
+          type="number"
+          step="1"
+          min="1"
+          max="720"
+          bind:value={settings.session.inactivityMinutes}
+        />
+        <button type="button" onclick={() => resetSession('inactivityMinutes')}>Reset</button>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Detector</legend>
+      <p class="muted" style="font-size: 12px;">Controls how much page context is captured when detecting what a form field is asking.</p>
+      <label class="row">
+        <span style="flex: 1;">Max ancestor HTML chars (default {DEFAULT_SETTINGS.detector.maxAncestorHtml})</span>
+        <input
+          type="number"
+          step="500"
+          min="1000"
+          max="100000"
+          bind:value={settings.detector.maxAncestorHtml}
+        />
+        <button type="button" onclick={() => resetDetector('maxAncestorHtml')}>Reset</button>
+      </label>
+      <label class="row">
+        <span style="flex: 1;">Max ancestor inner-text chars (default {DEFAULT_SETTINGS.detector.maxAncestorInnerText})</span>
+        <input
+          type="number"
+          step="50"
+          min="50"
+          max="2000"
+          bind:value={settings.detector.maxAncestorInnerText}
+        />
+        <button type="button" onclick={() => resetDetector('maxAncestorInnerText')}>Reset</button>
+      </label>
+      <label class="row">
+        <span style="flex: 1;">Max ancestor levels climbed (default {DEFAULT_SETTINGS.detector.maxAncestorLevels})</span>
+        <input
+          type="number"
+          step="1"
+          min="1"
+          max="20"
+          bind:value={settings.detector.maxAncestorLevels}
+        />
+        <button type="button" onclick={() => resetDetector('maxAncestorLevels')}>Reset</button>
+      </label>
+      <label class="row">
+        <span style="flex: 1;">
+          Extra ancestor levels after finding a second form control
+          (default {DEFAULT_SETTINGS.detector.extraAncestorLevelsAfterMatch}). Once the climber
+          hits an ancestor whose subtree has another input, it goes this many more levels up
+          before snapshotting the HTML. Bounded at runtime by "Max ancestor levels climbed".
+        </span>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          max="20"
+          bind:value={settings.detector.extraAncestorLevelsAfterMatch}
+        />
+        <button type="button" onclick={() => resetDetector('extraAncestorLevelsAfterMatch')}>Reset</button>
+      </label>
+      <label class="row">
+        <span style="flex: 1;">Max attribute value length (default {DEFAULT_SETTINGS.detector.maxAttrValueLen})</span>
+        <input
+          type="number"
+          step="10"
+          min="20"
+          max="500"
+          bind:value={settings.detector.maxAttrValueLen}
+        />
+        <button type="button" onclick={() => resetDetector('maxAttrValueLen')}>Reset</button>
+      </label>
+    </fieldset>
+
+    <fieldset>
       <legend>Custom context windows</legend>
       <p class="muted" style="font-size: 12px;">Override <code>getContextWindow(modelId)</code> for custom Ollama models.</p>
       {#each Object.entries(settings.customContextWindows) as [m, t] (m)}
@@ -190,7 +340,7 @@
     <div class="row" style="justify-content: flex-end;">
       {#if saveMsg}<span class="muted">{saveMsg}</span>{/if}
       <button class="primary" onclick={save} disabled={saving} type="button">
-        {saving ? 'Saving…' : 'Save thresholds'}
+        {saving ? 'Saving…' : 'Save'}
       </button>
     </div>
   {/if}

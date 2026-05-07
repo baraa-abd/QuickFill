@@ -46,7 +46,14 @@
         style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; gap: 4px;"
       >
         <div class="row" style="justify-content: space-between; align-items: baseline;">
-          <strong style="word-break: break-word;">{f.canonicalKey ?? f.label}</strong>
+          <div class="col" style="gap: 2px;">
+            <strong style="word-break: break-word;">{f.canonicalKey ?? f.label}</strong>
+            {#if f.templateContext}
+              <span class="muted" style="font-size: 11px;">
+                {f.templateContext.templateName} · record #{f.templateContext.recordIndex}
+              </span>
+            {/if}
+          </div>
           <span class="muted" style="font-size: 11px; white-space: nowrap;">{ago(f.at)}</span>
         </div>
 

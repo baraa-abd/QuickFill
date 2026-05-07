@@ -46,7 +46,7 @@ async function send(payload: {
   await ensureOffscreen();
   try {
     const resp = (await chrome.runtime.sendMessage({
-      __autofill_offscreen__: true,
+      __quickfill_offscreen__: true,
       ...payload
     })) as OffscreenResponse | undefined;
     if (!resp) return { ok: false, error: 'no response from offscreen' };

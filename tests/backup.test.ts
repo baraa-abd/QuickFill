@@ -15,7 +15,8 @@ const profile: Profile = {
   canonicalData: {
     'first name': { id: 'first name', values: ['Ada'], defaultValueIndex: 0, updatedAt: 1 }
   },
-  sensitiveKeys: []
+  sensitiveKeys: [],
+  groupTemplates: []
 };
 const stories: Story[] = [
   { id: 's-1', content: 'STAR narrative', keywords: ['leadership'], createdAt: 1, updatedAt: 1 }
@@ -32,7 +33,10 @@ describe('backup round-trip', () => {
       settings: DEFAULT_SETTINGS
     });
     expect(env.format).toBe('backup/v1');
-    expect(env.version).toBe(1);
+    // BACKUP_VERSION bumped to 2 when group-template support landed; v1
+    // payloads still import cleanly because Profile.groupTemplates uses
+    // .catch([]) in the schema.
+    expect(env.version).toBe(2);
 
     const r = await unpackBackup(env, 'export-pass');
     expect(r.ok).toBe(true);

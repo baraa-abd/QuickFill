@@ -223,7 +223,7 @@ export type RpcRequest<N extends RpcName> = z.infer<(typeof rpcContracts)[N]['re
 export type RpcResponse<N extends RpcName> = z.infer<(typeof rpcContracts)[N]['response']>;
 
 type RpcEnvelope<N extends RpcName = RpcName> = {
-  __autofill_rpc__: true;
+  __quickfill_rpc__: true;
   name: N;
   payload: unknown;
 };
@@ -232,7 +232,7 @@ function isEnvelope(v: unknown): v is RpcEnvelope {
   return (
     typeof v === 'object' &&
     v !== null &&
-    (v as { __autofill_rpc__?: unknown }).__autofill_rpc__ === true
+    (v as { __quickfill_rpc__?: unknown }).__quickfill_rpc__ === true
   );
 }
 
@@ -252,7 +252,7 @@ export async function rpcCall<N extends RpcName>(
     };
   }
   const envelope: RpcEnvelope<N> = {
-    __autofill_rpc__: true,
+    __quickfill_rpc__: true,
     name,
     payload: reqParse.data
   };
@@ -380,6 +380,7 @@ export const portEventSchema = z.discriminatedUnion('t', [
   z.object({ t: z.literal('ack') }),
   z.object({ t: z.literal('close') }),                                                 // SW → both
   z.object({ t: z.literal('abort') }),                                                 // either → SW
+  z.object({ t: z.literal('keepalive') }),                                             // panel → SW (heartbeat / inactivity-reset)
   z.object({ t: z.literal('status'), message: z.string() }),                           // SW → panel
   z.object({                                                                           // SW → panel
     t: z.literal('error'),
@@ -388,9 +389,34 @@ export const portEventSchema = z.discriminatedUnion('t', [
   }),
 
   // ───── detective handshake (SW ↔ content script in active frame) ─────
-  z.object({ t: z.literal('run-detective') }),                                         // SW → content
+  z.object({                                                                           // SW → content
+    t: z.literal('run-detective'),
+    detector: z.object({
+      maxAncestorHtml:               z.number(),
+      maxAncestorInnerText:          z.number(),
+      maxAncestorLevels:             z.number(),
+      // Optional for back-compat with older SWs / panels that predate the knob.
+      extraAncestorLevelsAfterMatch: z.number().optional(),
+      maxAttrValueLen:               z.number()
+    }).optional()
+  }),
   z.object({ t: z.literal('fill-plan'), plan: fillPlanSchema }),                        // content → SW
   z.object({ t: z.literal('detective-failed'), reason: z.string() }),                   // content → SW
+
+  // ───── navigator key-interception control (SW → elected content) ─────
+  // Tells the elected content script to start or stop intercepting Alt+, / Alt+.
+  // Sent on entering / leaving the 'navigating' phase. The content script gates
+  // its keydown listener on this flag so it never interferes with the page when
+  // no navigator is open.
+  // `prevKey`/`nextKey` ride along when active=true so the content script's
+  // keydown listener picks up the user's rebound shortcut. Optional for
+  // backwards-compat with older content scripts.
+  z.object({
+    t: z.literal('navigator-active'),
+    active: z.boolean(),
+    prevKey: z.string().min(1).max(1).optional(),
+    nextKey: z.string().min(1).max(1).optional()
+  }),                                                                                   // SW → content
 
   // ───── manual highlight fallback ─────
   z.object({ t: z.literal('manual-highlight-start') }),                                 // SW → content
@@ -419,7 +445,8 @@ export const portEventSchema = z.discriminatedUnion('t', [
       'story_setup',
       'answering',
       'committed',
-      'cancelled'
+      'cancelled',
+      'navigating'
     ])
   }),
 
@@ -503,7 +530,71 @@ export const portEventSchema = z.discriminatedUnion('t', [
     canonicalKey: z.string(),
     value: z.string(),
     sensitive: z.boolean()
-  })
+  }),
+
+  // ───── alias judge (SW ↔ panel) ─────
+  // SW → panel: a classifier-routed match was followed up by the alias-judge
+  // LLM, which decided the field label is a genuine alias of the canonical
+  // target and persisted it. The panel surfaces a transient toast with a
+  // "Delete alias" button so the user can revert if the judge got it wrong.
+  z.object({
+    t: z.literal('alias-added'),
+    id: z.string(),
+    alias: z.string(),
+    canonicalDisplay: z.string(),
+    target: z.union([
+      z.object({ kind: z.literal('flat'), canonicalKey: z.string() }),
+      z.object({
+        kind: z.literal('template'),
+        templateId: z.string(),
+        templateName: z.string(),
+        key: z.string()
+      })
+    ])
+  }),
+  // panel → SW: remove a previously-persisted alias (the user clicked the
+  // "Delete alias" button on the toast or the toast was confirmed bad).
+  z.object({
+    t: z.literal('delete-alias'),
+    id: z.string(),
+    alias: z.string(),
+    target: z.union([
+      z.object({ kind: z.literal('flat'), canonicalKey: z.string() }),
+      z.object({
+        kind: z.literal('template'),
+        templateId: z.string(),
+        templateName: z.string(),
+        key: z.string()
+      })
+    ])
+  }),
+  // SW → panel: dismiss / remove a previously-shown alias toast (after the
+  // user confirmed delete, or after the panel's auto-dismiss timer).
+  z.object({ t: z.literal('alias-toast-remove'), id: z.string() }),
+
+  // ───── group-template navigator (SW ↔ panel) ─────
+  // SW → panel: open/refresh the navigator card with the template snapshot,
+  //            currently-shown record id, and the matched template-key. The
+  //            template object is sent in full so the panel can render every
+  //            field of every record without an extra RPC round-trip.
+  z.object({
+    t: z.literal('navigator-open'),
+    template: z.unknown(),       // GroupTemplate — validated by the panel via the loose RecentActivity pattern
+    currentRecordId: z.string(),
+    matchedKey: z.string(),
+    fillEntryId: z.string()
+  }),
+  z.object({
+    t: z.literal('navigator-update'),
+    currentRecordId: z.string()
+  }),
+  z.object({ t: z.literal('navigator-close-broadcast') }),
+
+  // panel → SW
+  z.object({ t: z.literal('navigator-next') }),
+  z.object({ t: z.literal('navigator-prev') }),
+  z.object({ t: z.literal('navigator-jump'), recordId: z.string() }),
+  z.object({ t: z.literal('navigator-close') })
 ]);
 
 export type PortEvent = z.infer<typeof portEventSchema>;

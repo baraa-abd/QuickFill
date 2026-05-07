@@ -29,7 +29,8 @@ The extension is **user-centric**, not page-centric:
 - It does **not** auto-fire on focus.
 - It does **not** automatically submit anything.
 - It is initiated **only** when the user has a field in focus (fallback: the cursor is over an element) and presses
-  `Alt+A`.
+  `Alt+A` (or `Alt+Shift+A` to force the manual-highlight flow regardless of
+  whether tree-climbing would have succeeded).
 - All data is stored locally and encrypted behind a master password. The only
   non-local network traffic is the LLM round-trip when the user has chosen 
   a cloud backend, or the one-time download/update of the local embedding model.
@@ -53,7 +54,12 @@ when the browser closes, and is excluded from backups.
 ### 2.1 Profile
 
 A dictionary of canonical keys → one or more values, plus an alias map so
-multiple labels can resolve to the same canonical key.
+multiple labels can resolve to the same canonical key. The Profile also
+carries a list of **group templates** — schema-typed lists of records used
+for repeated structured data like work experience, education, projects,
+publications, etc. Group templates were added after the initial design;
+they are now first-class members of the data model and a major axis of the
+matching / classifier / fill flows.
 
 ```ts
 type ProfileValue = {
@@ -62,6 +68,38 @@ type ProfileValue = {
                               // Profile.canonicalData — kept on the value for self-describing logs / exports.
   values: string[];           // a key may have several values
   defaultValueIndex: number;      // the index of the value that is to be treated as the default value. Initially set to 0, and can be changed in the Profile management UI in settings.
+  updatedAt: number;
+};
+
+// ── Group templates ────────────────────────────────────────────────────────
+// A GroupTemplate defines an ordered list of typed keys (slots) plus an
+// ordered list of records, each record being a "filling-in" of those keys.
+// Per-template-key aliases live ON THE KEY (NOT in the global Profile.aliasMap)
+// to avoid collisions when a label like "company" exists in both a flat
+// profile entry and one or more templates.
+type GroupTemplateKeyType = 'string' | 'number' | 'boolean' | 'array';
+
+type GroupTemplateKey = {
+  key: string;                // cleaned canonical key for this slot
+  type: GroupTemplateKeyType; // hint for editor + fill-time coercion (storage is string or string[])
+  aliases: string[];          // cleaned aliases, NOT including the identity entry
+  sensitive: boolean;         // excluded from cloud-LLM prompts, same as Profile.sensitiveKeys
+};
+
+type GroupRecord = {
+  id: string;
+  values: Record<string, string | string[]>; // missing key = no value yet
+  createdAt: number;
+  updatedAt: number;
+};
+
+type GroupTemplate = {
+  id: string;
+  name: string;                       // user-visible, e.g. 'Work Experience'
+  keys: GroupTemplateKey[];           // ordered for display + navigator
+  records: GroupRecord[];             // ordered for display + navigator step order
+  defaultRecordId: string | null;     // initial record shown by the navigator
+  createdAt: number;
   updatedAt: number;
 };
 
@@ -74,12 +112,17 @@ type Profile = {
   aliasMap: Record<string, string>;
   canonicalData: Record<string, ProfileValue>;
   sensitiveKeys: string[];   // canonical keys flagged as sensitive (excluded from cloud-LLM prompts by default).
+  groupTemplates: GroupTemplate[]; // empty for fresh installs / pre-template backups
 };
 ```
 
-Initialized at onboarding from a user-uploaded resume (LLM-parsed). Editable
-at any time on the Options → Profile page (add/remove canonical keys, edit
-values, set default value, manage aliases, mark/unmark sensitive).
+Initialized at onboarding from a user-uploaded resume (LLM-parsed). The
+resume parser produces both flat profile entries and group templates (work
+experience, education, activities, …). Editable at any time on the
+Options → Profile page (add/remove canonical keys, edit values, set
+default value, manage aliases, mark/unmark sensitive); group templates
+have their own dedicated editor section (`GroupTemplatesEditor`) for
+managing keys, aliases, records, and per-key sensitivity.
 
 ### 2.2 Answer history
 
@@ -155,7 +198,9 @@ type Backend = 'anthropic' | 'openai' | 'gemini' | 'ollama';
 
 type PromptTaskName =
   | 'classifier' | 'chooser' | 'answer_length' | 'story_answer_prompt'
-  | 'resume_parse' | 'story_discovery' | 'generic_key';
+  | 'resume_parse' | 'story_discovery' | 'generic_key' | 'alias_judge';
+
+type PromptParams = { temperature?: number; maxTokens?: number };
 
 type Settings = {
   activeBackend: Backend;
@@ -169,8 +214,12 @@ type Settings = {
   // DEFAULT_PROMPT_TEMPLATES for this task" (resolved at render time;
   // never stored as a sentinel — see §7.3).
   prompts: Partial<Record<PromptTaskName, string>>;
+  // Per-prompt LLM params (temperature, maxTokens). Missing keys fall back
+  // to DEFAULT_PROMPT_PARAMS in shared/constants.ts; users can override per
+  // task on the Options → Prompts page.
+  promptParams: Partial<Record<PromptTaskName, PromptParams>>;
   matching: {
-    fuseThreshold: number;     // default 0.3 — used by §4.2 alias match and §4.5 add-to-profile.
+    fuseThreshold: number;     // default 0.1 — used by §4.2 alias match and §4.5 add-to-profile.
   };
   rag: {
     historyGenericKeyWeight: number; // default 0.3 ('w' in §4.4 step 2).
@@ -182,8 +231,19 @@ type Settings = {
     genericKeySimilarityThreshold:  number; // default 0.75 (§4.4 step 5).
   };
   logging: {
-    enabled:     boolean;            // master switch for §11.
-    logPayloads: boolean;            // gate the `payload` field on log entries.
+    enabled:         boolean;        // master switch for §11.
+    logPayloads:     boolean;        // gate the `payload` field on log entries.
+    showDiagnostics: boolean;        // show the diagnostic panel in the side panel.
+  };
+  session: {
+    inactivityMinutes: number;       // default 15 — see §4.6.
+  };
+  detector: {
+    maxAncestorHtml:               number;    // default 15000 — max chars of cleaned ancestor outerHTML sent to classifier.
+    maxAncestorInnerText:          number;    // default 300   — max chars of ancestor innerText sidecar.
+    maxAncestorLevels:             number;    // default 7     — hard ceiling on total levels climbed (covers both the search step AND the extra levels below).
+    extraAncestorLevelsAfterMatch: number;    // default 2     — once an ancestor with another form control is found, climb this many more levels before snapshotting. Jointly bounded by maxAncestorLevels.
+    maxAttrValueLen:               number;    // default 120   — attribute values longer than this are truncated during HTML cleaning.
   };
   // Override `getContextWindow(modelId)` for custom Ollama models (§6.3).
   customContextWindows: Record<string, number>;
@@ -212,6 +272,19 @@ panel collects (companyName, role, userBlurb) from the user and the SW derives
 `genericKey` + embedding (§4.4 step 1). The result is cached here so subsequent
 fills in the same session don't re-prompt. The user can clear or replace it
 from the active-application badge in the side panel header.
+
+Two additional pieces of session-only state live alongside `ActiveApplication`:
+
+- **`recentActivity`** — a ring buffer (capped at 50) of recent `FillActivity`
+  / `SaveActivity` entries owned by the SW. Persisted to
+  `chrome.storage.session` (not encrypted) so it survives SW eviction within
+  a browsing session; cleared at browser close. The side panel mirrors this
+  buffer, and the panel's revert-fill / delete-save / switch-fill-value
+  buttons act against entries in it.
+- **`recordContext`** — sticky `(templateId, recordId)` pair set whenever a
+  fill resolves through a group template, used so that subsequent Alt+A
+  presses for the same template default to the same record (see §4.3a).
+  Cleared whenever a non-template fill happens.
 
 ---
 
@@ -283,18 +356,19 @@ Two channels:
    token streams, status / error / setup-needed broadcasts, commit / revert
    / abort.
 
-Implementation note: keep the protocol in `src/background/messaging.ts` and
-import it from every context. The validator wrapper that swallows
-disconnect-during-post errors (Chrome bfcache, SW restart) is critical —
-without it the panel will throw on routine page navigations.
+The protocol must swallow disconnect-during-post errors (Chrome bfcache,
+SW restart) — without that, the panel will throw on routine page
+navigations.
 
-**Port discrimination.** Because both the content script and the side panel
-connect under the same port name `"fill-session"`, the SW must distinguish
-them in `chrome.runtime.onConnect`. Use `port.sender?.tab != null` as the
-discriminator: content script ports always have `sender.tab` set; side panel
-ports do not. Assign each to a typed wrapper immediately on connect
-(`ContentPort` vs `PanelPort`) and reject (disconnect) any port that matches
-neither.
+**Port discrimination.** The content script and the side panel connect
+under **distinct port names**: `"fill-session-content"` and
+`"fill-session-panel"`. The SW reads `port.name` in
+`chrome.runtime.onConnect` and assigns each to a typed wrapper
+(`ContentPort` vs `PanelPort`); ports with any other name are rejected
+(disconnected) immediately. (An earlier design used a single port name
+and discriminated by `sender.tab != null`, but that misclassifies a
+side-panel page when it's opened as a regular tab — e.g. for debugging.
+Per-role names make discrimination unambiguous.)
 
 ---
 
@@ -306,20 +380,60 @@ element that the cursor points to, if it is of appropriate type, see
 below; if this also fails, the user is shown an error in the side panel). 
 There is no auto-detect.
 
+There is also `Alt+Shift+A`, a sibling shortcut that **forces** the manual-
+highlight flow regardless of whether tree-climbing would have succeeded.
+The detective still runs to capture the FillPlan (elementRef, fieldType,
+options, currentValue) needed to commit later, but the workflow jumps to
+manual-highlight (§4.1 fallback) for the question text. This is the user's
+escape hatch when the auto-detected label is wrong (e.g. for awkwardly
+nested labels, or when several fields share a single visible heading).
+
 The user can press `Esc` at any moment from `Alt+A` until the field value 
 is committed, which aborts the session, and cancels any in-flight LLM stream.
 
-The Alt+A shortcut is registered in the manifest under commands. The
-Background SW listens to `chrome.commands.onCommand`. When `trigger-fill`
+The Alt+A / Alt+Shift+A / Alt+S shortcuts are registered in the manifest
+under commands (`trigger-fill`, `trigger-fill-manual`, `add-to-profile`).
+The Background SW listens to `chrome.commands.onCommand`. When a command
 fires, Chrome passes the active `Tab` as the second argument to the command
-listener (Chrome 114+); use `tab.id` directly. For robustness, also handle
+listener (Chrome 114+); use `tab.id` directly.
+
+**Content script presence fallback.** Tabs that were already open before
+the extension loaded (or whose script disappeared into bfcache) won't have
+a content port. When the SW finds no live content port for the tab on a
+command, it programmatically injects the script via
+`chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files })`
+(file paths read from the runtime manifest, since crxjs hashes them) and
+waits up to ~1s for the script's port to register before starting the
+session. If injection fails (chrome:// URLs, blocked file:// pages, etc.)
+the panel shows a clear "couldn't talk to this page" error. This is why
+the manifest carries the `scripting` permission alongside the auto-injected
+content script.
+
+The two navigator commands (Alt+, / Alt+.) are NOT manifest commands —
+Chrome MV3 only allows 4 user-defined keyboard shortcuts per extension,
+and the four slots are already taken. Instead, both the content script
+(while a fill targets a focused page element) and the side panel each
+register their own capture-phase `keydown` listeners that fire when a
+group-template navigator is open. See §4.3a for the navigator workflow.
+
+Because these aren't manifest commands, `chrome://extensions/shortcuts`
+can't rebind them. The key characters are stored in
+`settings.navigator.{prevKey, nextKey}` (defaults `,` and `.`) and rebound
+in-app from **Options → Shortcuts**. The Alt modifier is fixed; only the
+single key character is configurable. The SW reads the keys at navigator
+open time and pushes them to the elected content script via the
+`navigator-active` port message; the side panel reads them directly from
+settings on mount. For robustness, also handle
 the case where `tab` is undefined by falling back to
-`chrome.tabs.query({ active: true, currentWindow: true })`. The SW messages the content script to run the detective **first**, then calls
-`chrome.sidePanel.open({ tabId: tab.id })`. This ordering is important:
-`chrome.sidePanel.open()` may move focus away from the page in some Chrome
-versions, so the detective must be dispatched before the panel opens to avoid
-a race where `document.activeElement` has already changed by the time the
-content script reads it.
+`chrome.tabs.query({ active: true, currentWindow: true })`. In the implemented order, `chrome.sidePanel.open({ tabId: tab.id })` is
+called synchronously inside the user-gesture window of the command handler
+(this is required by Chrome — sidePanel.open must be invoked from within a
+user gesture or it throws). Immediately after, the SW calls the synchronous
+`session.start()`, which posts `run-detective` to every content port for
+the tab over the long-lived port. Because the port post is itself
+synchronous, the content script's `document.activeElement` capture (the
+very first line of its `run-detective` handler — see §4.1) lands before any
+focus shift caused by `sidePanel.open()` propagating.
 
 ### 4.1 Tree climbing — find the question text
 
@@ -358,9 +472,10 @@ Workflow for manual highlight:
     and show current selection in side panel.
 4.  Normalize whitespace; reject empty selections (by showing a warning in the side panel)
 5.  On Enter, submit current non-empty selection
-6.  On Esc, cancel
+6.  On Esc, abort the session per §4.6 (this also tears down the manual-highlight tooltip)
 7.  Register listeners in capture phase and suppress only extension-owned handlers
-8.  Time out after 1 minute of inactivity
+8.  Time out after 5 minutes of inactivity (separate from the §4.6 session
+    inactivity timer; this one only governs the on-page tooltip)
 
 The detective also captures, alongside the label:
 
@@ -421,11 +536,24 @@ After the question text is known, the SW:
    delete anything that is not alphanumeric or whitespace, collapse whitespace,
    trim). This is the same recipe used everywhere a label is normalized — see
    §6.2 for why the shared helper is critical.
-2. Run a fuzzy search against `profile.aliasMap` using fuse.js with threshold
-   `settings.matching.fuseThreshold` (default 0.3, editable on Options → General).
-   Resolve the matched alias to its canonical key.
+2. Build a ranked **candidate list** spanning both flat profile keys
+   (`Profile.aliasMap`) and every group template's per-key aliases, using
+   fuse.js with threshold `settings.matching.fuseThreshold` (default 0.1,
+   editable on Options → General). Each candidate is either a flat key
+   (`{ kind: 'flat', canonicalKey }`) or a template slot
+   (`{ kind: 'template', templateId, templateName, key }`). Per-template-key
+   alias maps are searched separately (one fuse.js index per template) so
+   a label like "company" can match both a flat profile key AND one or more
+   template slots without collisions.
+3. Branch on candidate count:
+   - **Exactly one candidate** → resolve directly without involving the LLM.
+   - **Zero or multiple candidates** → escalate to the §4.3 classifier, which
+     gets the candidate list and either picks one of them or returns
+     `profile_update` / `story_answer`. The classifier never invents a
+     canonical key outside the candidate list when the list is non-empty.
 
-If the match succeeds:
+If a single candidate (or the classifier's chosen candidate) targets a
+flat key:
 
 - Take the default value for the canonical key for `text | email | tel
   | url | number | date | password | textarea | contenteditable | unknown`
@@ -466,23 +594,72 @@ If the match succeeds:
   fills and saves). Also in the side panel, the user can switch to a different stored 
   value for the canonical key, if such a value exists.
 
+When the resolved candidate is a **template slot**, the SW instead uses the
+group-template auto-commit path documented in §4.3a (sticky record context,
+record navigator, etc.) instead of the flat-profile path above. The
+template's currently-active record (per the sticky `recordContext` rule)
+supplies the value; field-type coercion (select/radio fuzzy match,
+checkbox boolean coercion, default value) is otherwise the same.
+
+**No preview / confirm step for direct profile hits.** Both flat and
+template auto-commits write to the field immediately and end the session;
+the user can hit Alt+S afterwards to save a different value, click the
+side panel's value-switcher (when other stored values exist for the same
+key), or use the recent-fills delete/revert button to roll back. Only
+`profile_update` (writes to the profile) and `story_answer` (LLM-generated)
+require panel interaction before commit.
+
 ### 4.3 LLM classifier — what kind of field is this?
 
-If the direct match fails, the SW asks the LLM to classify the field. The
+If §4.2 returned zero candidates, OR returned more than one candidate that
+needs disambiguation, the SW asks the LLM to classify the field. The
 classifier sees:
 
 - the field label/question,
 - the field type (`textarea`, `text`, etc.),
 - the available options (for selects/radios),
-- the list of canonical profile keys,
+- the list of flat canonical profile keys,
+- the full list of group templates (name + each key, type, aliases),
+- the **pre-selected match candidates** from §4.2 (when non-empty, the
+  prompt instructs the model to pick one of these or escalate),
+- the focused element descriptor (compact tag + key attributes — used as a
+  fallback identifier),
+- the **cleaned + pruned outerHTML of a smartly chosen ancestor** as
+  structural context — the strongest signal for which fieldset / template
+  section the field belongs to (e.g. "Experience #2"). The detective climbs
+  up to the first ancestor whose subtree contains a *different* form
+  control than the focused one and then takes
+  `detector.extraAncestorLevelsAfterMatch` more levels beyond it (default 2,
+  jointly capped at `detector.maxAncestorLevels` = 7), so depth adapts to
+  the actual form structure. Some sites bury the question text high above
+  the input — bumping `extraAncestorLevelsAfterMatch` (and, if needed,
+  `maxAncestorLevels`) lets the user broaden the snapshot when the default
+  doesn't capture enough context. The
+  focused element inside the snippet is tagged with
+  `data-quickfill-focus="1"` so the classifier can locate it directly. The
+  snippet is then cleaned (style/class/script/svg/event-handler attributes
+  stripped, comments dropped, attribute values truncated) and pruned in a
+  text-preserving way: subtrees that aren't on the focused element's
+  ancestor spine are flattened to their visible text, keeping nearby
+  labels and option text but discarding cousin nesting depth. A 15000-char
+  fallback truncation slices a window ending right after the focused
+  element's closing tag (information before the focus matters more — the
+  focus is typically near the bottom of its own subtree, so the window
+  extends backward as far as possible),
+- a 300-char `innerText` snapshot of the same ancestor as a noise-free
+  plain-text sidecar — useful when the HTML is hard to read.
 
 The classifier returns one of three categories:
 
 1. **`profile_existing_value`** — this is a basic personal data point that
-   exists in the stored profile (that fuzzy matching above failed to catch).
-   The LLM returns both the category and the `canonicalKey` it matched.
-   The SW looks up `profile.canonicalData[canonicalKey]` and proceeds from
-   the "if the match succeeds" bullet in §4.2 onward. 
+   exists in the stored profile or in one of the group templates' slots
+   (that fuzzy matching above failed to catch, or that needed
+   disambiguation). The LLM returns both the category and a structured
+   `target` — either `{ kind: 'flat', canonicalKey }` or
+   `{ kind: 'template', templateName, key }`. The SW resolves it to the
+   matching profile / template and proceeds via the same auto-commit path
+   used in §4.2 (flat → tryAutoCommitFromProfile;
+   template → tryAutoCommitFromTemplate, opening the navigator).
    No second fuzzy pass is run.
 
 2. **`profile_update`** — this looks like a basic personal data point that's
@@ -503,6 +680,98 @@ The classifier returns one of three categories:
 The classifier prompt template is editable on Options → Prompts. The
 default lives in `shared/constants.ts → DEFAULT_PROMPT_TEMPLATES.classifier`
 and asks for strict JSON (choose the schema and be consistent with it).
+
+#### Alias-judge follow-up (classifier-routed `profile_existing_value` only)
+
+When the classifier — not the §4.2 fuzzy matcher — produces the resolved
+target, the SW kicks off a **separate, narrow LLM call** (the `alias_judge`
+task) to decide whether the field label should be remembered as an alias for
+the canonical key on future forms. Kept separate from the classifier prompt
+so that prompt stays focused; runs fire-and-forget after a successful commit
+so it never blocks the user.
+
+The judge gets the canonical key, the cleaned field label, and the same
+ancestor HTML snippet that fed the classifier. The prompt explicitly:
+
+- accepts only **genuine** aliases — generic synonyms, abbreviations, or
+  rewordings that would map to the same canonical key on any form, even
+  without the surrounding context, and
+- rejects labels that are too **peculiar / form-specific** (e.g. "your
+  manager's email at Acme Co.") or too **generic / context-dependent**
+  (labels that only match because of the ancestor HTML, not on their own).
+
+On `{ "isAlias": true }` the SW writes back:
+
+- flat target → `profile.aliasMap[cleanedLabel] = canonicalKey`,
+- template target → append `cleanedLabel` to the matching template-key's
+  `aliases` array.
+
+The helper short-circuits before the LLM call when the cleaned label is
+identical to the target's key or when the alias is already mapped, so an
+oft-seen label only costs one judge round-trip per profile lifetime.
+Failures are logged and otherwise silent — the alias is just not added.
+
+The `alias_judge` prompt template, temperature, and max-tokens are editable
+from Options → Prompts (§10) like every other LLM task; the defaults live
+in `shared/constants.ts → DEFAULT_PROMPT_TEMPLATES.alias_judge` /
+`DEFAULT_PROMPT_PARAMS.alias_judge`.
+
+On a successful write, the SW broadcasts an `alias-added` port event and the
+side panel shows a transient **alias toast** (`AliasAddedToast.svelte`):
+
+- Says "Added alias `<label>` → `<canonical>`" with the same explanation in
+  small text.
+- Has two buttons: **Keep alias** (just dismisses the toast) and
+  **Delete alias** (posts `delete-alias` to the SW, which reverses the
+  write — removing the entry from `profile.aliasMap` for flat targets, or
+  filtering it out of the template-key's `aliases` array for template
+  targets — and broadcasts `alias-toast-remove` so any other panel
+  instance also drops the toast).
+- Auto-dismisses after a few seconds if the user does nothing; the alias
+  stays on the profile in that case.
+
+The toast is independent of the active session: it can outlive the §4.6
+abort/commit/close cycle, since the alias write itself is independent of
+the in-flight session and the user might still want to revert it after
+the session ends.
+
+### 4.3a Group-template auto-commit + record navigator
+
+When §4.2 / §4.3 resolves a candidate of `kind: 'template'`:
+
+1. **Pick the record.** Apply the sticky-context rule:
+   - If `recordContext` is set AND points to the SAME template, reuse its
+     record (when that record still exists).
+   - Otherwise fall back to the template's `defaultRecordId`, or the first
+     record if the default is missing.
+2. **Resolve the value** for the matched key off the picked record, with
+   per-field-type coercion (select/radio → fuse against options;
+   checkbox → boolean coercion; otherwise the raw string). Skip if the
+   record has no value for the matched key (caller falls through to
+   story_answer).
+3. **Commit and record** a `FillActivity` (with `templateContext`:
+   `{ templateId, templateName, recordId, recordIndex, key }`) so the
+   recent-activity card surfaces "Work Experience #2 / job title" instead
+   of just the bare key.
+4. **Update sticky context** to `(templateId, recordId)`.
+5. **Enter the `navigating` phase** and open the **record navigator** in the
+   side panel. The navigator card shows the full record list (a 1-line
+   summary per record) with prev/next/jump controls. The user can step
+   through records with:
+   - the panel buttons,
+   - `Alt+,` / `Alt+.` while focus is on the page (content-script keydown
+     listener; only intercepted while navigation is active),
+   - `Alt+,` / `Alt+.` while focus is in the side panel (panel keydown
+     listener; same routing).
+   Each switch re-commits the same form field with the new record's value
+   and updates the same `FillActivity` entry in place (preserving the
+   original pre-fill `previousValue` for revert). The navigator stays open
+   until the user closes it from the panel, presses Esc (which closes
+   the session entirely), or starts a new fill.
+
+Sticky context is cleared whenever a non-template fill happens
+(flat-profile match, `profile_update`, `story_answer`) so the user
+"leaves" the template flow naturally.
 
 ### 4.4 LLM answer generation (story_answer path)
 
@@ -554,6 +823,9 @@ When the classifier says `story_answer`:
      `maxlength` attribute, use that integer directly (no LLM call).
      Otherwise, run the `answer_length` prompt (one-shot, §7.3) with the
      field label and field type to estimate a sensible character budget.
+     If the model returns garbage that doesn't parse to a positive integer,
+     the resolver falls back to a 600-character default rather than failing
+     the session.
 
    Sensitive profile fields (anything in `profile.sensitiveKeys`) must be
    excluded from `profile` — never sent to a cloud LLM unless the
@@ -664,7 +936,19 @@ runs the detective on the focused field, then:
   - The write is logged to the side panel status: "Saved to profile under `<key>`."
     A delete button is available next to it to delete the saved value if the user
     desires. If there was an old value in the field, the delete button should revert
-    to that rather than completely erase it. 
+    to that rather than completely erase it.
+  - **Template-aware routing.** Before the flat-profile path runs, the SW
+    consults `recordContext`. If the cleaned label fuzzy-matches a key on
+    the SAME template that the sticky context points at, the save is routed
+    into that template record's slot instead of the flat profile. For
+    `array`-typed template keys, the value is appended (case-insensitive
+    dedup) rather than overwriting. Sensitive checkbox flips
+    `GroupTemplateKey.sensitive` for that key.
+  - **Snapshot-based undo.** Every save (flat or template) snapshots the
+    full pre-save `Profile` into the `SaveActivity` entry, so the panel's
+    delete button atomically rolls back the entire write (whether it
+    created a new canonical key, appended to an existing one, or modified
+    a template record).
 
 ### 4.6 Esc behavior — global, every state
 
@@ -691,6 +975,34 @@ In both cases, the SW:
 The side panel "Cancel" button does the same thing by posting the same
 `abort`.
 
+### 4.7 Session lifetime — inactivity timeout + keepalive
+
+A single fill session would otherwise be at the mercy of two unrelated
+timers: Chrome MV3's ~30 s service-worker idle eviction, and the absence
+of any explicit "give up" rule. To make long edits (especially crafting a
+`story_answer` in the side panel) safe, the SW runs an **inactivity timer**
+on the live `Session` and the side panel runs a **keepalive heartbeat**
+against the SW.
+
+- **Inactivity timer (SW).** When a session starts, the FillSession arms a
+  `setTimeout` for `Settings.session.inactivityMinutes` (default 15, editable
+  on Options → General). Every inbound port event — panel button, manual-
+  highlight selection, navigator key, `keepalive` heartbeat, etc. — calls
+  `touchActivity()`, which resets the timer. On expiry the SW broadcasts a
+  status ("Session timed out due to inactivity.") and aborts via §4.6.
+  The fallback is `DEFAULT_SESSION_INACTIVITY_MS` (15 min) until settings
+  finish loading right after start.
+- **Keepalive heartbeat (panel).** The side panel posts a `keepalive` port
+  event every 20 s while a session is active (well below MV3's ~30 s SW
+  idle window) and on every user interaction with the panel
+  (`pointerdown` / `keydown` / `input`, capture phase). This both keeps the
+  service worker alive while the user is composing and resets the SW's
+  inactivity timer on every interaction.
+
+`keepalive` is the only port event whose effect on the SW is purely the
+`touchActivity()` tick — there is no other state change. When no session is
+active the SW silently ignores it.
+
 ---
 
 ## 5. Side panel — what the user sees at every step
@@ -701,7 +1013,8 @@ draft.
 
 ### 5.1 States (top-level)
 
-The side panel mounts on page load and displays one of:
+The side panel mounts on page load and displays one of four top-level
+phases:
 
 - **Loading** — RPC to determine `is-initialized` / `is-unlocked` is in
   flight.
@@ -709,13 +1022,17 @@ The side panel mounts on page load and displays one of:
   the onboarding tab.
 - **Locked** — meta exists but DEK isn't in session storage; show password
   field, plus "Use recovery phrase" link.
-- **Unlocked / idle** — Dashboard, no active session: shows a hint
-  ("Press Alt+A on a form field to start"), the active-application badge
-  if one is set, recent fill history, and — when `profile.sensitiveKeys`
-  is non-empty and the active backend is a cloud provider — a persistent
-  **"Some profile fields are hidden from the AI"** badge. The badge links
-  to Options → Profile so the user can review which fields are sensitive.
-- **Unlocked / active session** — Dashboard with the live session UI.
+- **Unlocked** — Dashboard mounts. The Dashboard itself has two sub-views
+  driven by whether a fill session is active:
+  - *Idle sub-view* — shows a hint ("Press Alt+A on a form field to
+    start"), the active-application badge if one is set, recent fill
+    history, and — when `profile.sensitiveKeys` is non-empty and the
+    active backend is a cloud provider — a persistent **"Some profile
+    fields are hidden from the AI"** badge that links to Options →
+    Profile so the user can review which fields are sensitive.
+  - *Active-session sub-view* — the live session UI described in §5.2.
+  The two sub-views are not separate top-level phases; the Dashboard
+  swaps in/out of the live UI as the SW broadcasts session events.
 
 ### 5.2 Live session UI — what it shows at each phase
 
@@ -729,7 +1046,8 @@ Concretely:
 | Detective failed                      | Card: "Could not find the question text. Highlight it on the page, then press Enter."               |
 | Manual highlight captured             | Status: "Got it. Continuing…"                                                                       |
 | Field cannot be filled (disabled etc.)| Status: "This field can't be filled." Session ends.                                                 |
-| Classifier → `profile_existing_value` | Same card as "Profile hit" — the LLM identified a canonical key the fuzzy match missed.             |
+| Direct profile match (§4.2)           | No card. The value is auto-committed; status: "Filled `<value>` from profile." The new fill appears in `FillHistory`, where the user can revert it or switch to a different stored value if one exists. |
+| Classifier → `profile_existing_value` | Same as "Direct profile match" — the LLM identified a canonical key the fuzzy match missed; auto-commit, no card. |
 | One-shot LLM call failure             | ErrorBanner with error message + Retry button. Session paused, not aborted. Cancel / Esc still works. |
 | Classifier → profile_update           | Card: "We don't have this in your profile. Add it?" with editable key + value, Confirm / Cancel.    |
 | Classifier → story_answer, no app     | Card: ApplicationSetup form (company, role, blurb).                                                 |
@@ -740,6 +1058,7 @@ Concretely:
 | User edited and approved              | Status: "Saved." Toast: "Save as story?" if discovery proposed one.                                 |
 | Dedup merged into older               | Toast: "Merged into an older, more general answer. Keep older instead?" with Undo button.           |
 | Add-to-profile (Alt+S)                | Status: "Saved to profile under `<key>`." (or confirmation card on long labels / values per §4.5.)  |
+| Group-template auto-commit            | RecordNavigator card showing the matched template, the active record, and prev/next/jump controls. Status: "Filled from `<template>` record N/M." |
 | Anywhere, Esc pressed                 | Status: "Cancelled." Card cleared.                                                                  |
 
 The status ticker is the canonical "what's happening" surface; cards are
@@ -759,18 +1078,27 @@ for things the user must act on.
   preview for a textarea bound to local state.
 - `StatusTicker.svelte` — last status message.
 - `ErrorBanner.svelte` — last error message + retry button when retryable.
-- `StoryDiscoveryPrompt.svelte`, `DedupToast.svelte`
-  — the two toast types described in §5.2.
-- `SensitiveFieldsBadge.svelte` — persistent badge rendered in the Dashboard
-  header when `profile.sensitiveKeys` is non-empty and the active backend is
-  a cloud provider. Links to Options → Profile.
+- `StoryDiscoveryPrompt.svelte`, `DedupToast.svelte`,
+  `AliasAddedToast.svelte` — the toast types described in §5.2 and §4.3
+  (alias-judge follow-up).
+- The "some profile fields hidden from the LLM" badge is rendered inline by
+  `Dashboard.svelte` (no dedicated component file) when
+  `profile.sensitiveKeys` is non-empty and the active backend is a cloud
+  provider. Links to Options → Profile.
 - `FillHistory.svelte` — session-local list of recent fills (ephemeral; the
   persistent history is on the Options page).
 - `SaveHistory.svelte` — session-local list of recent saves with a delete button
   next to each (ephemeral; the persistent history is on the Options page).
-- `DiagnosticPanel.svelte` — collapsed-by-default; runs the
-  `run-diagnostic` RPC and shows SW + storage + embedding + ports + LLM
-  presence-check results.
+- `ProfileUpdateCard.svelte`, `AddToProfileCard.svelte` — the confirmation
+  cards for the `profile_update` classifier branch (§4.3) and the long-label
+  / long-value Alt+S confirmation gate (§4.5) respectively.
+- `RecordNavigator.svelte` — the prev/next/jump record navigator card shown
+  while a group-template auto-commit holds the session in `navigating`
+  phase (§4.3a). Mirrors the navigator state from the SW; the panel keydown
+  listener routes Alt+, / Alt+. through it.
+- `DiagnosticPanel.svelte` — gated by `settings.logging.showDiagnostics`;
+  runs the `run-diagnostic` RPC and shows SW + storage + embedding + ports
+  + LLM presence-check results.
 
 ---
 
@@ -909,6 +1237,21 @@ The orchestrator owns the abort semantics: pass `req.signal = abortController.si
 through to each adapter's `fetch`; an Esc triggers
 `abortController.abort()` and the generator returns silently.
 
+**Default model per backend.** `DEFAULT_SETTINGS` ships with the
+following per-backend model strings (fully editable in
+Options → Models):
+
+| Backend   | Default model              |
+|-----------|----------------------------|
+| Anthropic | `claude-sonnet-4-6`        |
+| OpenAI    | `gpt-5-mini`               |
+| Gemini    | `gemini-3-flash-preview`   |
+| Ollama    | `gemma4:e4b`               |
+
+The default `activeBackend` is `ollama` so a fresh install does not
+require an API key to function (assuming the user has Ollama running
+locally with the default model pulled).
+
 ### 7.3 Editable prompt templates
 
 Every prompt template lives in `shared/constants.ts →
@@ -925,13 +1268,14 @@ The prompt tasks are at minimum (mode = how the orchestrator runs the prompt):
 
 | Task                  | Mode      | Returns           | Used in   |
 |-----------------------|-----------|-------------------|-----------|
-| `classifier`          | one-shot  | strict JSON: `{ category: 'profile_existing_value', canonicalKey: string }` \| `{ category: 'profile_update', canonicalKey: string }` \| `{ category: 'story_answer' }` | §4.3 |
+| `classifier`          | one-shot  | strict JSON, discriminated by `category`: `{ category: 'profile_existing_value', target: { kind: 'flat', canonicalKey: string } \| { kind: 'template', templateName: string, key: string } }` \| `{ category: 'profile_update', canonicalKey: string }` \| `{ category: 'story_answer' }`. The legacy flat-only shape `{ category: 'profile_existing_value', canonicalKey: string }` is also accepted for back-compat (treated as `kind: 'flat'`). | §4.3 |
 | `chooser`             | one-shot  | a single option label from the provided list, or the literal string `"No good options"` | §4.2 |
 | `answer_length`       | one-shot  | a positive integer (max characters)         | §4.4 step 3 |
 | `story_answer_prompt` | streaming | free-text answer, ≤ `max_length` chars      | §4.4 step 4 |
 | `resume_parse`        | one-shot  | strict JSON: extracted profile fields + suggested stories | §9 step 5 |
 | `story_discovery`     | one-shot  | strict JSON: `{ proposeStory: boolean; content?: string; keywords?: string[] }` | §4.4 step 6 |
 | `generic_key`         | one-shot  | strict JSON: `{ genericKey: string }`        | §4.4 step 1 |
+| `alias_judge`         | one-shot  | strict JSON: `{ isAlias: boolean }`          | §4.3 alias-judge follow-up |
 
 "One-shot" prompts go through the orchestrator's `complete` helper (§7.1),
 which drains the stream and returns `{ ok, text }`. Only `story_answer_prompt`
@@ -1098,9 +1442,10 @@ A wizard in a new tab opened on first install. Steps:
    auto-flagged from `SENSITIVE_CANONICAL_KEYS` (§8.4). The user can skip
    this step and add profile fields manually on the next screen. If the
    `parse-resume` RPC fails (LLM error, JSON parse failure, or network
-   error), the onboarding UI shows an inline error with a **Retry** button
-   to re-send the same extracted text, and a **Skip** link to bypass resume
-   upload and proceed directly to step 6 (manual profile entry).
+   error), the onboarding UI surfaces the error inline next to the parse
+   button so the user can re-submit the same extracted text, and offers a
+   **Skip** link to bypass resume upload and proceed directly to step 6
+   (manual profile entry).
 6. **Profile review** — editable list of extracted fields, with the raw
    extracted text in a collapsible panel so the user can audit what the
    LLM saw. The user accepts (or edits + accepts) and the profile is
@@ -1115,12 +1460,26 @@ A wizard in a new tab opened on first install. Steps:
 Tabbed Svelte page (deep-linkable via URL hash). Locked behind the master
 password — show a minimal unlock form when the vault is locked.
 
-- **General** — shortcut display (Chrome's
-  `chrome://extensions/shortcuts` is where the user actually rebinds),
-  and an **Advanced thresholds** disclosure exposing every numeric knob 
-  from `Settings` (§2.4): `matching.fuseThreshold`, `rag.historyGenericKeyWeight`,
-  `rag.minTokens`, `rag.contextPercent`, `dedup.questionSimilarityThreshold`,
-  `dedup.genericKeySimilarityThreshold`, `customContextWindows` table.
+- **General** — Shortcuts card showing the four manifest commands
+  (Alt+A, Alt+Shift+A, Alt+S — rebound at `chrome://extensions/shortcuts`,
+  reachable via a button on the card) and a separate fieldset for the
+  record-navigator keys `Alt+settings.navigator.prevKey` and
+  `Alt+settings.navigator.nextKey`. The navigator keys are NOT manifest
+  commands and are rebound directly here (single character each, Alt
+  modifier fixed). The card also hosts the
+  `ChangePasswordCard` (change master password via current password OR via
+  the recovery phrase), and an **Advanced thresholds** disclosure exposing
+  every numeric knob from `Settings` (§2.4): `matching.fuseThreshold`,
+  `rag.historyGenericKeyWeight`, `rag.minTokens`, `rag.contextPercent`,
+  `dedup.questionSimilarityThreshold`,
+  `dedup.genericKeySimilarityThreshold`,
+  `session.inactivityMinutes` (the §4.7 inactivity ceiling),
+  `detector.maxAncestorHtml` (1 000–100 000, default 15 000),
+  `detector.maxAncestorInnerText` (50–2 000, default 300),
+  `detector.maxAncestorLevels` (1–20, default 7),
+  `detector.extraAncestorLevelsAfterMatch` (0–20, default 2),
+  `detector.maxAttrValueLen` (20–500, default 120),
+  `customContextWindows` table.
   Each knob has its default printed next to the input and a "reset to
   default" button. **"Reset extension"** sits at the bottom behind a
   two-step confirmation dialog ("Are you sure? This cannot be undone.").
@@ -1132,7 +1491,10 @@ password — show a minimal unlock form when the vault is locked.
 - **Profile** — list canonical entries; sensitive values masked by
   default with a reveal button. Edit values; add/remove canonical keys;
   manage aliases (a sub-table per canonical key showing its aliases with
-  remove buttons + an add-alias input). Mark/unmark sensitive.
+  remove buttons + an add-alias input). Mark/unmark sensitive. The same
+  page also hosts the `GroupTemplatesEditor` for managing group templates:
+  add/rename templates, manage their keys (name, type, aliases, sensitive
+  flag), CRUD records, set a default record per template.
 - **Stories** — CRUD. Each row shows content + keywords + created date.
 - **Answer history** — list / filter / delete entries. Show company,
   role, question, answer, generic key, dates.
@@ -1140,10 +1502,13 @@ password — show a minimal unlock form when the vault is locked.
   or base URL + model + reachability check (Ollama). Show model name
   picker with per-backend defaults; allow custom model strings.
 - **Prompts** — one editable textarea per `PromptTaskName`, with reset +
-  customized-badge as described in §7.3.
-- **Logger** — view + clear the persisted ring buffer (RPC reads the
+  customized-badge as described in §7.3. Each task also exposes per-prompt
+  LLM params (temperature + maxTokens) backed by `Settings.promptParams`,
+  with defaults from `DEFAULT_PROMPT_PARAMS`.
+- **Debug** (the Logger tab) — view + clear the persisted ring buffer (RPC reads the
   entire buffer — it's bounded, so pagination isn't needed). Toggles for
-  `enabled` and `logPayloads`. Filter by level + tag in-browser.
+  `enabled`, `logPayloads`, and `showDiagnostics` (which exposes the
+  side-panel `DiagnosticPanel`). Filter by level + tag in-browser.
 - **Backup** — Export (with export-password prompt + a download button)
   and Import (file picker, password prompt, mode picker).
 
@@ -1193,9 +1558,15 @@ inside.
 
 ## 13. Manifest
 
+The shape below is the load-bearing subset — permissions, commands, CSP,
+content-script registration, and web-accessible resources. The actual
+`src/manifest.config.ts` also defines the usual `version`,
+`description`, `icons`, and `action` entries that every extension needs;
+those are omitted here for brevity.
+
 ```ts
 manifest_version: 3,
-name: 'AutoFill Career Agent',
+name: 'QuickFill',
 minimum_chrome_version: '116',
 
 content_scripts: [
@@ -1215,7 +1586,8 @@ permissions: [
   'activeTab',
   'sidePanel',
   'downloads',
-  'offscreen',         // required for Transformers.js (no document in SW)
+  'offscreen',   // required for Transformers.js (no document in SW)
+  'scripting',   // for the on-demand content-script injection fallback (§4 commands)
 ],
 host_permissions: ['<all_urls>'],
 
@@ -1224,15 +1596,21 @@ content_security_policy: {
 },
 
 commands: {
-  'trigger-fill':   { suggested_key: { default: 'Alt+A' }, description: 'Start auto-fill on the focused field' },
-  'add-to-profile': { suggested_key: { default: 'Alt+S' }, description: "Save the focused field's current value to the profile" },
+  'trigger-fill':        { suggested_key: { default: 'Alt+A' },       description: 'Start auto-fill on the focused field' },
+  'trigger-fill-manual': { suggested_key: { default: 'Alt+Shift+A' }, description: 'Start fill with manual question highlight (skip auto-detection)' },
+  'add-to-profile':      { suggested_key: { default: 'Alt+S' },       description: "Save the focused field's current value to the profile" },
+  // Alt+, / Alt+. (record navigator prev/next) are NOT manifest commands —
+  // Chrome MV3 caps user-defined shortcuts at 4 per extension. They are
+  // handled by capture-phase keydown listeners in the content script and
+  // the side panel; see §4.3a.
 },
 
 web_accessible_resources: [{
-  // 'models/*' must be web-accessible because Transformers.js resolves
-  // model file URLs relative to the offscreen document's origin and may
-  // fetch them via paths that Chrome validates against this list.
-  resources: ['models/*'],
+  // The offscreen document needs to be loadable by URL from the SW. We
+  // deliberately do NOT list models/* — Transformers.js runs with
+  // env.allowLocalModels = false in src/offscreen/index.ts, so model files
+  // are fetched from the HuggingFace CDN and cached in IndexedDB.
+  resources: ['src/offscreen/index.html'],
   matches: ['<all_urls>'],
 }],
 ```
@@ -1267,57 +1645,65 @@ Approved Stack:
 src/
 ├── manifest.config.ts
 ├── shared/
-│   ├── constants.ts                  # DEFAULT_*, SENSITIVE_CANONICAL_KEYS, KDF params
-│   ├── types.ts                      # Single source of truth for every shape
+│   ├── constants.ts                  # DEFAULT_*, SENSITIVE_CANONICAL_KEYS, KDF params, prompt templates + defaults
+│   ├── types.ts                      # Single source of truth for every shape (incl. group templates)
 │   ├── schemas.ts                    # zod mirrors of types
-│   └── tokens.ts                     # estimateTokens + getContextWindow
+│   ├── tokens.ts                     # estimateTokens + getContextWindow
+│   └── clean.ts                      # shared cleanLabel() recipe (§6.2)
 ├── background/
-│   ├── index.ts                      # SW entry + every RPC handler
-│   ├── messaging.ts                  # rpc() + TypedPort + portEventSchema
-│   ├── fill-session.ts               # Orchestrator (state machine)
-│   ├── fill-planner.ts               # Receives FillPlan from content script; orchestrates classify/match/generate steps
-│   ├── classifier.ts                 # NEW: runs the classifier prompt
-│   ├── matcher.ts                    # profile lookup (alias / exact / fuzzy)
-│   ├── history.ts                    # ingest + dedup
-│   ├── story-discovery.ts            # post-edit story prompt
+│   ├── index.ts                      # SW entry: RPC handlers, port wiring, commands, FillSession DI, recent-activity ring buffer, content-script injection fallback
+│   ├── messaging.ts                  # RPC contracts + TypedPort + portEventSchema
+│   ├── fill-session.ts               # Orchestrator (state machine) — owns the active fill, navigator, sticky record context
+│   ├── classifier.ts                 # Runs the classifier prompt (template-aware, candidate-aware)
+│   ├── matcher.ts                    # matchAlias + matchTargets (flat + group-template) + chooser fallback
+│   ├── history.ts                    # ingest + dedup + merge-undo
 │   ├── logger.ts                     # ring-buffer + redaction
 │   ├── backup.ts                     # pack / unpack / merge
 │   ├── llm/
-│   │   ├── orchestrator.ts           # streamWith / completeActive
+│   │   ├── orchestrator.ts           # streamWith / complete
 │   │   ├── prompts.ts                # renderPrompt + extractJson
 │   │   ├── stream.ts                 # SSE / JSONL helpers
 │   │   ├── types.ts                  # ChatRequest / StreamChunk
 │   │   ├── ollama.ts, anthropic.ts, openai.ts, gemini.ts
-│   │   ├── answer.ts                 # build prompt + RAG + stream
+│   │   ├── answer.ts                 # streamAnswer + resolveMaxLength + runChooser + runStoryDiscovery
 │   │   └── generic-key.ts            # one-shot generic-key derivation
 │   ├── rag/
 │   │   ├── embeddings.ts             # offscreen proxy
 │   │   ├── retriever.ts              # token-budgeted top-K over history
 │   │   └── similarity.ts             # vector math
 │   ├── resume/
-│   │   └── parser.ts                # SW: resume_parse LLM call + JSON validation + fold into Profile
+│   │   └── parser.ts                 # SW: resume_parse LLM call + JSON validation + fold into Profile (incl. group templates)
 │   └── storage/
-│       ├── store.ts                  # encrypted Store singleton
+│       ├── store.ts                  # encrypted Store singleton + SESSION_KEYS
 │       ├── crypto.ts                 # PBKDF2 + AES-GCM + base64
 │       ├── recovery.ts               # phrase generator + verifier
 │       └── wordlist.ts               # 256-word list
 ├── content/
-│   ├── index.ts                      # Port + handlers + Esc listener
-│   ├── detective.ts                  # Tree-climbing label discovery
+│   ├── index.ts                      # Port + handlers + Esc listener + Alt+, / Alt+. navigator listener
+│   ├── detective.ts                  # Tree-climbing label discovery, FillPlan capture
 │   ├── commit.ts                     # Native-setter writes + revert capture
 │   ├── shadow.ts                     # Shadow-DOM helpers
-│   ├── highlight-fallback.ts         # Manual-highlight tooltip (shared by Alt+A tree-climbing fallback and Alt+S)
-│   └── log.ts                        # Routes log lines through RPC
+│   └── highlight-fallback.ts         # Manual-highlight tooltip (Alt+A fallback, Alt+Shift+A forced, Alt+S)
 ├── offscreen/
-│   └── index.{html,ts}               # Hosts Transformers.js
-├── sidepanel/                        # Svelte 5; see §5
-├── options/                          # Svelte 5; see §10
+│   └── index.{html,ts}               # Hosts Transformers.js (env.allowLocalModels = false)
+├── sidepanel/                        # Svelte 5; see §5 — incl. RecordNavigator, ProfileUpdateCard, AddToProfileCard, session-store.svelte.ts
+├── options/                          # Svelte 5; see §10 — incl. GroupTemplatesEditor, ChangePasswordCard
 └── onboarding/                       # Svelte 5; see §9
-    ├── (Svelte components)
+    ├── App.svelte, main.ts, index.html
     └── extract/
         ├── docx.ts                   # mammoth.js bytes → text (uses DOMParser).
         └── txt.ts                    # UTF-8 decode bytes → text.
 ```
+
+Notable departures from the originally-planned layout:
+
+- No standalone `fill-planner.ts` / `story-discovery.ts` — the planning is
+  inside `fill-session.ts`, and `runStoryDiscovery` lives next to the
+  story-answer streamer in `llm/answer.ts`.
+- `shared/clean.ts` is its own file (the shared label-cleaning recipe is
+  load-bearing enough that it has its own home — see §6.2).
+- The content script does not have a `log.ts` — it uses `chrome.runtime.sendMessage`
+  ad-hoc through the existing `log-event` RPC where needed.
 ---
 
 ## 16. Testing
@@ -1441,4 +1827,21 @@ A developer can consider the implementation done when:
       aborts normally.
 - [ ] Pressing Esc while focused inside the side panel (e.g., draft
       textarea) aborts the session identically to pressing Esc on the page
+- [ ] Pressing `Alt+Shift+A` on a focused field skips tree-climbing and
+      enters manual-highlight directly, with the FillPlan still captured
+      so commit later succeeds.
+- [ ] When a label fuzzy-matches a slot in a group template, the SW
+      auto-commits using the sticky `recordContext` (or the template's
+      `defaultRecordId` on first hit), then opens the side-panel record
+      navigator. Alt+, / Alt+. (from the page or the side panel) and the
+      panel's prev/next/jump buttons all switch the committed value to
+      a different record.
+- [ ] When more than one match candidate exists across flat keys + group
+      templates, the classifier is invoked with the candidate list and
+      either picks one or escalates to `profile_update` / `story_answer`.
+- [ ] Alt+S routed against a label that matches a key on the same
+      template as the sticky context writes into that record's slot
+      (appending for `array`-typed keys); flat-profile path otherwise.
+      Delete on the SaveActivity card atomically reverts via the
+      pre-save profile snapshot.
       — stream cancelled, panel cleared, status: "Cancelled".

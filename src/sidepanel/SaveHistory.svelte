@@ -31,7 +31,14 @@
         style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; gap: 4px;"
       >
         <div class="row" style="justify-content: space-between; align-items: baseline;">
-          <strong style="word-break: break-word;">{s.label}</strong>
+          <div class="col" style="gap: 2px;">
+            <strong style="word-break: break-word;">{s.label}</strong>
+            {#if s.templateContext}
+              <span class="muted" style="font-size: 11px;">
+                {s.templateContext.templateName} · record #{s.templateContext.recordIndex}
+              </span>
+            {/if}
+          </div>
           <span class="muted" style="font-size: 11px; white-space: nowrap;">{ago(s.at)}</span>
         </div>
         <div

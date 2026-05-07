@@ -72,9 +72,10 @@ export const DEFAULT_PROMPT_PARAMS: Record<PromptTaskName, Required<PromptParams
   chooser:              { temperature: 0, maxTokens: 128 },
   answer_length:        { temperature: 0, maxTokens: 256 },
   story_answer_prompt:  { temperature: 0.2, maxTokens: 600 },
-  resume_parse:         { temperature: 0, maxTokens: 2048 },
+  resume_parse:         { temperature: 0, maxTokens: 10240 },
   story_discovery:      { temperature: 0, maxTokens: 768 },
-  generic_key:          { temperature: 0, maxTokens: 512 }
+  generic_key:          { temperature: 0, maxTokens: 512 },
+  alias_judge:          { temperature: 0, maxTokens: 64 }
 };
 
 export function resolvePromptParams(
@@ -116,6 +117,20 @@ export const DEFAULT_SETTINGS: Settings = {
     logPayloads: false,
     showDiagnostics: false
   },
+  session: {
+    inactivityMinutes: 15
+  },
+  navigator: {
+    prevKey: ',',
+    nextKey: '.'
+  },
+  detector: {
+    maxAncestorHtml:               15000,
+    maxAncestorInnerText:          300,
+    maxAncestorLevels:             7,
+    extraAncestorLevelsAfterMatch: 2,
+    maxAttrValueLen:               120
+  },
   customContextWindows: {}
 };
 
@@ -127,8 +142,8 @@ export const DEFAULT_PROMPT_TEMPLATES: Record<PromptTaskName, string> = {
   classifier: `You are an expert data classification agent routing a job application form field into one of three strict categories.
 
 <categories>
-1. "profile_existing_value": A basic personal data point already present in the existing profile keys.
-2. "profile_update": A basic personal data point NOT yet in the profile (e.g., middle name, pronouns, personal website). Suggest a normalized key (lowercase, spaces only).
+1. "profile_existing_value": A data point already present in the user's stored data — either a flat profile key, OR a slot inside one of the user's group templates (e.g. a Work Experience or Education record). Group-template fields commonly REPEAT across records (every work experience has its own "job title", "company", "start date", etc.) so when the surrounding HTML places the focused field inside a section that looks like one of these templates, prefer the template target.
+2. "profile_update": A basic personal data point NOT yet in the profile and NOT a slot inside any existing group template (e.g., middle name, pronouns, personal website). Suggest a normalized key (lowercase, spaces only).
 3. "story_answer": A narrative, open-ended, or experiential question requiring an essay or paragraph (e.g., "Tell us about a time...", "Why this company?").
 </categories>
 
@@ -138,11 +153,20 @@ Field type: {{field_type}}
 Available options (if any): {{field_options}}
 Existing canonical profile keys: {{profile_keys}}
 
-Focused element (the specific field the user wants to fill — use this to locate the target within the surrounding HTML):
+Existing group templates (each template is a schema for a list of records — Work Experience, Education, etc.):
+{{group_templates}}
+
+Pre-selected match candidates from the fuzzy matcher (these are the ONLY plausible "profile_existing_value" targets unless the matcher produced none; pick from this list when non-empty):
+{{match_candidates}}
+
+Focused element descriptor (compact identifier — fallback when the surrounding HTML is not available):
 {{element_descriptor}}
 
-Surrounding HTML context (outerHTML of the grandparent element that contains the focused field and nearby labels/siblings — use this as the primary source of truth for what the field is actually asking):
-{{grandparent_html}}
+Surrounding HTML context (outerHTML of an ancestor of the focused field — cleaned of styling noise and pruned so cousin subtrees are flattened to their visible text). The focused element inside this snippet is tagged with the attribute data-quickfill-focus="1" — locate it by that marker. This is your PRIMARY source of truth for what the field is asking:
+{{ancestor_html}}
+
+Plain-text innerText of the same ancestor (a noise-free sidecar — useful when the HTML is hard to read, but the HTML above is still the primary source):
+{{ancestor_inner_text}}
 </context>
 
 <instructions>
@@ -150,16 +174,22 @@ Determine what the focused field is asking by using the surrounding HTML as your
 
 Use the surrounding HTML to:
 - Identify the true question or label associated with the focused field
+- Decide whether the field belongs to a repeated section (work-experience block, education block, etc.) — if yes, route to a group template
 - Understand whether the field expects a brief factual answer or a narrative response
 - Recognize explicit labels, fieldset legends, aria-labelledby targets, or text nodes adjacent to the element
+
+When match candidates were pre-selected, you must either pick exactly one of them OR escalate to "profile_update" / "story_answer". Do not invent a different canonicalKey or template.
 </instructions>
 
 <rules>
 Output raw, unformatted JSON only. Begin your response with { and end it with }.
 Match exactly one of these output templates:
 
-Template 1 (Existing Value):
-{"category": "profile_existing_value", "canonicalKey": "exact_matched_key"}
+Template 1a (Existing Value — flat profile key):
+{"category": "profile_existing_value", "target": {"kind": "flat", "canonicalKey": "exact_matched_key"}}
+
+Template 1b (Existing Value — group template slot):
+{"category": "profile_existing_value", "target": {"kind": "template", "templateName": "exact_template_name", "key": "exact_template_key"}}
 
 Template 2 (New Value):
 {"category": "profile_update", "canonicalKey": "suggested_lowercase_key"}
@@ -169,13 +199,16 @@ Template 3 (Story Required):
 </rules>
 
 <examples>
-If you recognize the Label as "Legal First Name", with existing keys: ["first name", "last name", "email"], then:
-Output: {"category":"profile_existing_value","canonicalKey":"first name"}
+If you recognize the Label as "Legal First Name", with flat keys ["first name", "last name", "email"] and no relevant template:
+Output: {"category":"profile_existing_value","target":{"kind":"flat","canonicalKey":"first name"}}
 
-If you recognize the Label as "Portfolio URL", with existing keys: ["first name", "last name", "email"], then:
+If the focused field is "Job Title" inside a section that looks like a work-experience block (e.g. <fieldset> with legend "Experience #2") and a "Work Experience" template exists with a "job title" key:
+Output: {"category":"profile_existing_value","target":{"kind":"template","templateName":"Work Experience","key":"job title"}}
+
+If you recognize the Label as "Portfolio URL", with no matching flat key or template slot:
 Output: {"category":"profile_update","canonicalKey":"personal website"}
 
-If you recognize the Label as "Describe a complex technical challenge you solved", with existing keys: ["first name"], then:
+If you recognize the Label as "Describe a complex technical challenge you solved":
 Output: {"category":"story_answer"}
 </examples>
 
@@ -258,20 +291,74 @@ Answer:`,
 </resume_text>
 
 <rules>
-1. Extract standard profile data using common lowercase keys (e.g., "first name", "email", "education").
+1. Extract standard profile data using common lowercase keys (e.g., "first name", "email"). For fields that REPEAT (multiple work experiences, multiple education entries, multiple activities, multiple publications, etc.), put them in "groupTemplates" as a list of records — DO NOT collapse them into a single string.
 2. Identify impactful STAR narratives (Situation, Task, Action, Result) and assign 2-5 thematic keyword tags to each.
+   These stories should be narrated in the first-person, as if the applicant is describing their own experience. Focus on unique, specific, and compelling stories that highlight the applicant's skills and achievements.
 3. Output raw, unformatted JSON only. Begin your response with { and end it with }.
-4. Output strictly this exact JSON skeleton, filling in the blanks:
+4. Flat profile values must be plain — use a string, number, or simple array of strings. Use groupTemplates for ANY repeated structured data (work history, education, activities, projects, publications, certifications, languages-with-levels, etc.). Never put arrays-of-objects in "profile".
+5. Each group template should have a clear, lowercase \`name\` (e.g., "work experience", "education", "activities") and a \`keys\` list. Each key has a lowercase \`key\` name, an optional \`type\` ("string" | "number" | "boolean" | "array"; default "string"), an optional \`aliases\` array of synonyms (lowercase), and an optional \`sensitive\` boolean.
+6. Each record is a flat object whose keys MATCH the template's keys exactly (or one of their aliases). Missing values may be omitted. Boolean values use "yes"/"no". Array-typed values are JSON arrays of strings.
+7. Output strictly this exact JSON skeleton (the keys in the profile / template are just typical examples — adapt to whatever the resume actually contains):
 </rules>
 
 <output_scheme>
 {
   "profile": {
-    "key_name": "value"
+    "first name": "Jane",
+    "email": "jane@example.com",
+    "skills": ["Python", "React", "SQL"],
+    "spoken languages": ["English (native)", "Spanish (intermediate)"],
+    "work authorization": "US Citizen"
   },
+  "groupTemplates": [
+    {
+      "name": "work experience",
+      "keys": [
+        { "key": "job title", "type": "string", "aliases": ["title", "position", "role"] },
+        { "key": "company", "type": "string", "aliases": ["employer", "organization"] },
+        { "key": "location", "type": "string" },
+        { "key": "start date", "type": "string", "aliases": ["from"] },
+        { "key": "end date", "type": "string", "aliases": ["to"] },
+        { "key": "currently working", "type": "boolean" },
+        { "key": "description", "type": "string", "aliases": ["responsibilities"] }
+      ],
+      "records": [
+        {
+          "job title": "Senior Software Engineer",
+          "company": "Acme Corp",
+          "location": "San Francisco, CA",
+          "start date": "2022-01",
+          "end date": "2024-08",
+          "currently working": "no",
+          "description": "Led the migration to a microservices architecture..."
+        }
+      ]
+    },
+    {
+      "name": "education",
+      "keys": [
+        { "key": "school", "type": "string", "aliases": ["university", "institution"] },
+        { "key": "degree", "type": "string" },
+        { "key": "field of study", "type": "string", "aliases": ["major"] },
+        { "key": "gpa", "type": "string" },
+        { "key": "start date", "type": "string" },
+        { "key": "end date", "type": "string", "aliases": ["graduation date"] }
+      ],
+      "records": [
+        {
+          "school": "MIT",
+          "degree": "B.S.",
+          "field of study": "Computer Science",
+          "gpa": "3.9",
+          "start date": "2014",
+          "end date": "2018"
+        }
+      ]
+    }
+  ],
   "stories": [
     {
-      "content": "One to two paragraph STAR narrative",
+      "content": "One to two paragraph STAR narrative in the applicant's own voice",
       "keywords": ["tag1", "tag2"]
     }
   ]
@@ -339,6 +426,36 @@ Output strictly this exact JSON format:
   "genericKey": "phrase"
 }
 </output_scheme>
+
+Output:`,
+
+  alias_judge: `You are a careful linguistic judge. Decide whether the form-field label below is a genuine ALIAS for the existing canonical profile key — i.e. they refer to the SAME data point and the label would map to that key on ANY form, not just this one.
+
+<context>
+Canonical key: {{canonical_key}}
+Field label observed on the form: {{field_label}}
+Surrounding HTML context (provided ONLY so you can detect when the label is too context-dependent — do NOT use it to justify adding the alias):
+{{ancestor_html}}
+</context>
+
+<rules>
+1. Answer "true" only when the label is a generic synonym, abbreviation, common rewording, or translation that would unambiguously point to the canonical key on a typical form, even with NO surrounding context.
+2. Answer "false" when:
+   - The label is too peculiar / form-specific (e.g. "your manager's email at Acme Co.", "preferred salutation for the cover letter").
+   - The label is too generic / vague (e.g. "info", "details", "value") and matched only because of the surrounding HTML.
+   - The label is essentially identical to the canonical key (already covered — no need to add).
+   - You are not confident.
+3. Output raw JSON only. Match exactly one template:
+   {"isAlias": true}
+   {"isAlias": false}
+</rules>
+
+<examples>
+Canonical key: "first name"; Label: "Given name" -> {"isAlias": true}
+Canonical key: "phone number"; Label: "Mobile" -> {"isAlias": true}
+Canonical key: "email"; Label: "Reference #2 email at previous employer" -> {"isAlias": false}
+Canonical key: "linkedin"; Label: "URL" (only matched via surrounding context) -> {"isAlias": false}
+</examples>
 
 Output:`
 };

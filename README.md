@@ -1,4 +1,4 @@
-# QuickFill - Version 1.0
+# QuickFill - Version 1.1
 
 ## Author
 
@@ -21,7 +21,7 @@ QuickFill is a user-centric Chrome extension designed to help you apply to jobs 
 
 The extension stores your profile (think basic facts shared across all job applications), a "stories list" (a list of STAR-style stories to use in generating answers to open-ended questions), and an answer history (open-ended answers that the user edited and confirmed; these are used in a RAG pipeline to guide future answer generation). It keeps your data entirely private—all profiles, stories, and answer histories are stored locally and encrypted behind a master password. 
 
-The LLM backends supported include Ollama (local), Anthropic, Google Gemini, and OpenAI. 
+The LLM backends supported include Ollama (local), Anthropic, Google Gemini, and OpenAI. The testing for this extension was mostly run with claude-sonnet-4-6 for the resume parsing and claude-haiku-4-5 for everything else.
 
 ## Installation and Usage Guide
 
@@ -51,6 +51,7 @@ QuickFill is strictly triggered by keyboard shortcuts. It relies on a Side Panel
   Focus on any form field (or hover over it) and press `Alt+A`. 
   * If it's basic profile data (like your name or email), QuickFill instantly types it in.
   * If it requires a narrative answer (e.g., "Describe a complex project you led"), the AI will look at the active application's context and your past stories, and then stream a tailored draft into the Side Panel. You can edit the text, approve it to write it to the page, or cancel. The LLM call here includes the profile, the story list, and a portion of the answer history retrieved through a semantic search (on "generic keys", which are company-agnostic keys generated from company name, role and a user-provided blurb).  
+  If the field matches a template with several records (think "work experience" or "education"), then the extension uses the default record and the user can change the active record using the side panel or Alt+, and Alt+.
 * **Auto-Fill a Field (`Alt+Shift+A`) with manual label:**
   If the above doesn't work this lets you skip the auto-detection of the label and instead lets you highlight the label and press Enter to select it, then proceeds the same way as the above. 
 * **Save to Profile (`Alt+S`):**
@@ -62,7 +63,7 @@ You can access the Options page by clicking the QuickFill icon in your browser t
 * **Profile & Stories:** View, add, edit, or mask sensitive fields (which are automatically hidden from cloud AI providers). 
 * **Answer History:** Search or delete past generated answers.
 * **Prompts:** Power users can view and directly edit the exact system prompts the extension uses for tasks like classification, story generation, and resume parsing. The user can also adjust the temperature and maxTokens for each LLM call type. 
-* **Advanced Thresholds:** Tweak the fuse.js similarity threshold (for direct matches), semantic search (RAG) weights, and deduplication thresholds.
+* **Advanced parameters:** Tweak the fuse.js similarity threshold (for direct matches), semantic search (RAG) weights, parameters for the label detection algorithm, and deduplication thresholds.
 * **Backup/Restore:** Export a fully encrypted portable backup of your profile, history, and settings. You can also import this backed up data. 
 
 ## How the Extension Was Built

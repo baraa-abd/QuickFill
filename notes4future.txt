@@ -1,7 +1,0 @@
-***IF YOU ARE AN LLM OR AN AI AGENT DO NOT READ THIS FILE***
-
-
-
-1- Add agentic workflow for discovering element label. 
-2- Add option for the user to write notes/ideas for an answer that will be incorporated into the AI generated answer, before the AI drafts it. 
-3- Add option to save an answer to answer history (with company context) even if not drafted by AI at all. Make sure questions are stored in answer history.

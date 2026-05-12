@@ -23,6 +23,7 @@ import type { FieldType, GroupTemplate, Profile, Settings } from '$shared/types'
 import { resolvePromptTemplate, resolvePromptParams } from '$shared/constants';
 import { complete } from './llm/orchestrator';
 import { extractJson, renderPrompt } from './llm/prompts';
+import { logger } from './logger';
 import type { MatchCandidate, MatchTarget } from './matcher';
 
 // ───────────────────────── Old prompt (preserved per user request) ─────────────────────────
@@ -100,7 +101,9 @@ const matchTargetSchema = z.union([
   })
 ]);
 
-const classifierResultSchema = z.discriminatedUnion('category', [
+// Internal schema — includes need_more_context which is handled by the loop
+// and never escapes as a public ClassifierResult.
+const llmResponseSchema = z.discriminatedUnion('category', [
   // profile_existing_value: backwards-compat — accept both the legacy
   // {canonicalKey: "..."} (treated as flat) and the new
   // {target: {kind, ...}} shape.
@@ -112,10 +115,11 @@ const classifierResultSchema = z.discriminatedUnion('category', [
     target: matchTargetSchema.optional()
   }),
   z.object({ category: z.literal('profile_update'), canonicalKey: z.string() }),
-  z.object({ category: z.literal('story_answer') })
+  z.object({ category: z.literal('story_answer') }),
+  z.object({ category: z.literal('need_more_context') })
 ]);
 
-type RawClassifierResult = z.infer<typeof classifierResultSchema>;
+type RawLlmResponse = z.infer<typeof llmResponseSchema>;
 
 export type ClassifierResult =
   | { category: 'profile_existing_value'; target: MatchTarget }
@@ -132,6 +136,10 @@ export type ClassifyArgs = {
   ancestorHtml: string | null;
   /** Plain-text innerText of the same ancestor (capped). May be null. */
   ancestorInnerText: string | null;
+  /** Progressive wider-ancestor snapshots for the agentic loop. Each entry is
+   *  one DOM level higher than the previous; consumed in order when the LLM
+   *  responds with need_more_context. */
+  additionalAncestorContexts: { html: string | null; innerText: string | null }[];
   /** Compact tag + key attributes identifying the focused field — fallback identifier when ancestorHtml is null. */
   elementDescriptor: string;
   /** Optional matcher candidates. When non-empty, the prompt asks the model to
@@ -143,65 +151,97 @@ export async function classifyField(
   args: ClassifyArgs
 ): Promise<
   | { ok: true; result: ClassifierResult }
-  | { ok: false; message: string; retryable: boolean }
+  | { ok: false; message: string; retryable: boolean; kind?: 'context-exhausted' }
 > {
   const template = resolvePromptTemplate('classifier', args.settings.prompts);
   const profileKeys = Object.keys(args.profile.canonicalData);
   const templates = args.profile.groupTemplates ?? [];
-  const prompt = renderPrompt(template, {
-    field_label: args.fieldLabel,
-    field_type: args.fieldType,
-    field_options: args.options ? args.options.map((o) => `- ${o}`).join('\n') : '(n/a)',
-    profile_keys: profileKeys.length ? profileKeys.map((k) => `- ${k}`).join('\n') : '(none)',
-    group_templates: formatGroupTemplates(templates),
-    match_candidates: formatMatchCandidates(args.matchCandidates ?? []),
-    element_descriptor: args.elementDescriptor || '(not available)',
-    ancestor_html: args.ancestorHtml ?? '(not available)',
-    ancestor_inner_text: args.ancestorInnerText ?? '(not available)'
-  });
-
   const { temperature, maxTokens } = resolvePromptParams('classifier', args.settings.promptParams);
-  const r = await complete(
-    args.settings,
-    { messages: [{ role: 'user', content: prompt }], temperature, maxTokens },
-    {
-      tag: 'classifier',
-      vars: {
-        field_label: args.fieldLabel,
-        field_type: args.fieldType,
-        options_count: args.options?.length ?? 0,
-        templates_count: templates.length,
-        candidates_count: args.matchCandidates?.length ?? 0,
-        element_descriptor: args.elementDescriptor,
-        ancestor_html: args.ancestorHtml ?? '',
-        ancestor_inner_text: args.ancestorInnerText ?? ''
+
+  // The agentic loop: start with the initial context snapshot and advance to
+  // wider ancestor snapshots whenever the LLM requests more context.
+  const maxAttempts = args.additionalAncestorContexts.length + 1;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const ctx = attempt === 0
+      ? { html: args.ancestorHtml, innerText: args.ancestorInnerText }
+      : args.additionalAncestorContexts[attempt - 1];
+
+    const prompt = renderPrompt(template, {
+      field_label: args.fieldLabel,
+      field_type: args.fieldType,
+      field_options: args.options ? args.options.map((o) => `- ${o}`).join('\n') : '(n/a)',
+      profile_keys: profileKeys.length ? profileKeys.map((k) => `- ${k}`).join('\n') : '(none)',
+      group_templates: formatGroupTemplates(templates),
+      match_candidates: formatMatchCandidates(args.matchCandidates ?? []),
+      element_descriptor: args.elementDescriptor || '(not available)',
+      ancestor_html: ctx.html ?? '(not available)',
+      ancestor_inner_text: ctx.innerText ?? '(not available)'
+    });
+
+    const r = await complete(
+      args.settings,
+      { messages: [{ role: 'user', content: prompt }], temperature, maxTokens },
+      {
+        tag: 'classifier',
+        vars: {
+          field_label: args.fieldLabel,
+          field_type: args.fieldType,
+          options_count: args.options?.length ?? 0,
+          templates_count: templates.length,
+          candidates_count: args.matchCandidates?.length ?? 0,
+          element_descriptor: args.elementDescriptor,
+          ancestor_html: ctx.html ?? '',
+          ancestor_inner_text: ctx.innerText ?? '',
+          context_attempt: attempt
+        }
       }
+    );
+    if (!r.ok) return r;
+
+    const json = extractJson(r.text);
+    if (json == null) {
+      return { ok: false, message: 'Classifier returned non-JSON output.', retryable: false };
     }
-  );
-  if (!r.ok) return r;
+    const parsed = llmResponseSchema.safeParse(json);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        message: `Classifier JSON did not match schema: ${parsed.error.message}`,
+        retryable: false
+      };
+    }
 
-  const json = extractJson(r.text);
-  if (json == null) {
-    return { ok: false, message: 'Classifier returned non-JSON output.', retryable: false };
-  }
-  const parsed = classifierResultSchema.safeParse(json);
-  if (!parsed.success) {
-    return {
-      ok: false,
-      message: `Classifier JSON did not match schema: ${parsed.error.message}`,
-      retryable: false
-    };
+    if (parsed.data.category === 'need_more_context') {
+      logger.debug('classifier', 'LLM requested wider context', {
+        attempt,
+        remaining: maxAttempts - attempt - 1,
+        field_label: args.fieldLabel
+      });
+      continue;
+    }
+
+    // One of the three final categories — normalize and return.
+    const normalized = normalizeClassifierResult(parsed.data as Exclude<RawLlmResponse, { category: 'need_more_context' }>, args.profile);
+    if (!normalized) {
+      // Unresolvable — treat as story_answer fallback (matches legacy
+      // "trust-but-verify" behavior for unknown flat keys).
+      return { ok: true, result: { category: 'story_answer' } };
+    }
+    return { ok: true, result: normalized };
   }
 
-  // Normalize the raw result into the structured ClassifierResult.
-  const normalized = normalizeClassifierResult(parsed.data, args.profile);
-  if (!normalized) {
-    // Unresolvable — treat as story_answer fallback (matches legacy
-    // "trust-but-verify" behavior for unknown flat keys).
-    return { ok: true, result: { category: 'story_answer' } };
-  }
-  return { ok: true, result: normalized };
+  // All context levels exhausted without a final decision — surface this as an
+  // error rather than silently falling back to story_answer, so the UI can
+  // tell the user to use the manual highlight fallback instead.
+  logger.info('classifier', 'exhausted all context levels — surfacing context-exhausted error', {
+    field_label: args.fieldLabel,
+    attempts: maxAttempts
+  });
+  return { ok: false, message: 'context-exhausted', retryable: false, kind: 'context-exhausted' };
 }
+
+type RawClassifierResult = Exclude<RawLlmResponse, { category: 'need_more_context' }>;
 
 /**
  * Convert the raw zod-parsed classifier output into a ClassifierResult.

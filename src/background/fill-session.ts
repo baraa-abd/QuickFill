@@ -685,10 +685,23 @@ export class FillSessionImpl {
       settings,
       ancestorHtml: plan.ancestorHtml ?? null,
       ancestorInnerText: plan.ancestorInnerText ?? null,
+      additionalAncestorContexts: plan.additionalAncestorContexts ?? [],
       elementDescriptor: plan.elementDescriptor ?? '',
       matchCandidates: candidates
     });
     if (!cl.ok) {
+      if (cl.kind === 'context-exhausted') {
+        // The LLM kept requesting wider context until there was none left.
+        // Tell the user and direct them to the manual highlight fallback.
+        this.deps.broadcastPanel({
+          t: 'status',
+          message:
+            "Couldn't determine what this field is asking, even after examining wider context. " +
+            'If you still want to fill it, press Alt+Shift+A to manually highlight the question text.'
+        });
+        this.endSession();
+        return;
+      }
       this.deps.broadcastPanel({
         t: 'error',
         message: `Classifier: ${cl.message}`,

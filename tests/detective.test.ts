@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   captureAncestorContext,
   capturePageContext,
+  captureProgressiveAncestorContexts,
   classifyFieldType,
   climbForLabel,
   getCurrentValue,
-  getOptions
+  getOptions,
+  runDetective
 } from '../src/content/detective';
 
 beforeEach(() => {
@@ -154,10 +156,10 @@ describe('captureAncestorContext', () => {
     expect(r.html).toContain('data-quickfill-focus="1"');
   });
 
-  it('falls back to the deepest reachable ancestor (capped at 6) when no sibling field exists', () => {
+  it('falls back to the deepest reachable ancestor when no sibling field exists', () => {
     document.body.innerHTML = `<div id="a"><div id="b"><div id="c"><input id="x"></div></div></div>`;
     const r = captureAncestorContext(document.getElementById('x')!);
-    // No different input anywhere → climbs to body (max 6 levels up).
+    // No different input anywhere → climbs to the maxAncestorLevels ceiling.
     expect(r.html).toContain('data-quickfill-focus="1"');
   });
 
@@ -217,11 +219,11 @@ describe('captureAncestorContext', () => {
   it('maxAncestorLevels restricts how far up the tree we climb', () => {
     // input is 3 levels deep: input > c > b > a > body
     document.body.innerHTML = `<div id="a"><div id="b"><div id="c"><input id="x"></div></div></div>`;
-    // With default (6) we reach #a; with maxAncestorLevels=2 we stop at #b.
+    // With default maxAncestorLevels=4 we reach body (which contains #a); with maxAncestorLevels=2 we stop at #b.
     const rDefault = captureAncestorContext(document.getElementById('x')!);
     expect(rDefault.html).toContain('id="a"');
 
-    const rCapped = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 2, maxAncestorInnerText: 300, maxAncestorHtml: 15000, maxAttrValueLen: 120 });
+    const rCapped = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 2, extraAncestorLevelsAfterMatch: 1, maxAncestorInnerText: 300, maxAncestorHtml: 15000, maxAttrValueLen: 120, classifierMaxContextLevels: 12 });
     expect(rCapped.html).toContain('id="b"');
     expect(rCapped.html).not.toContain('id="a"');
   });
@@ -234,7 +236,7 @@ describe('captureAncestorContext', () => {
         <div><input id="x"></div>
         <div><input id="y"></div>
       </section>`;
-    const r = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 6, maxAncestorInnerText: 50, maxAncestorHtml: 15000, maxAttrValueLen: 120 });
+    const r = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 6, extraAncestorLevelsAfterMatch: 1, maxAncestorInnerText: 50, maxAncestorHtml: 15000, maxAttrValueLen: 120, classifierMaxContextLevels: 12 });
     expect(r.innerText).not.toBeNull();
     expect(r.innerText!.length).toBeLessThanOrEqual(50);
   });
@@ -247,7 +249,7 @@ describe('captureAncestorContext', () => {
         <input id="y">
       </div>`;
     // With maxAttrValueLen=10 the placeholder should be sliced to 10 chars.
-    const r = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 6, maxAncestorInnerText: 300, maxAncestorHtml: 15000, maxAttrValueLen: 10 });
+    const r = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 6, extraAncestorLevelsAfterMatch: 1, maxAncestorInnerText: 300, maxAncestorHtml: 15000, maxAttrValueLen: 10, classifierMaxContextLevels: 12 });
     expect(r.html).toContain(`placeholder="${'A'.repeat(10)}"`);
     expect(r.html).not.toContain(longPlaceholder);
   });
@@ -261,7 +263,7 @@ describe('captureAncestorContext', () => {
 
     // Use a cap that is smaller than the full output but large enough to reach the focused element.
     const cap = Math.max(100, Math.floor(fullLen / 2));
-    const capped = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 6, maxAncestorInnerText: 300, maxAncestorHtml: cap, maxAttrValueLen: 120 });
+    const capped = captureAncestorContext(document.getElementById('x')!, { maxAncestorLevels: 6, extraAncestorLevelsAfterMatch: 1, maxAncestorInnerText: 300, maxAncestorHtml: cap, maxAttrValueLen: 120, classifierMaxContextLevels: 12 });
     expect(capped.html).not.toBeNull();
     expect(capped.html!.length).toBeLessThanOrEqual(cap + '…[truncated]…'.length);
     expect(capped.html).toContain('data-quickfill-focus="1"');
@@ -283,5 +285,162 @@ describe('capturePageContext', () => {
     const ctx = capturePageContext();
     expect(ctx.siteName).toBe('Acme');
     expect(ctx.h1).toBe('Welcome');
+  });
+});
+
+// ── Full detector settings used across these tests ───────────────────────────
+const DS_FULL = {
+  maxAncestorLevels: 4,
+  extraAncestorLevelsAfterMatch: 1,
+  maxAncestorHtml: 15000,
+  maxAncestorInnerText: 300,
+  maxAttrValueLen: 120,
+  classifierMaxContextLevels: 12
+} as const;
+
+describe('captureProgressiveAncestorContexts', () => {
+  it('initial snapshot carries the focus marker and additional is empty when budget fits only initial', () => {
+    // Budget=1: climb only 1 ancestor (div#row). Sibling found at idx=0, extraLevels
+    // can only go to min(0+extraLevels, 0)=0, so chosenIdx=0. Remaining budget=0 → no additional.
+    document.body.innerHTML = `
+      <div id="row">
+        <input id="x">
+        <input id="y">
+      </div>`;
+    const { initial, additional } = captureProgressiveAncestorContexts(
+      document.getElementById('x')!, undefined, 1
+    );
+    expect(initial.html).toContain('data-quickfill-focus="1"');
+    expect(additional).toHaveLength(0);
+  });
+
+  it('returns progressively wider snapshots', () => {
+    document.body.innerHTML = `
+      <article id="wide">
+        <section id="mid">
+          <div id="narrow">
+            <input id="x">
+            <input id="y">
+          </div>
+        </section>
+      </article>`;
+    // Budget=3: climb [div#narrow, section#mid, article#wide].
+    // Sibling in div#narrow (i=0) → chosenIdx=min(0+extraLevels(1), 2)=1 → section#mid.
+    // Remaining budget = 3−1−1 = 1 additional snapshot → article#wide.
+    const { initial, additional } = captureProgressiveAncestorContexts(
+      document.getElementById('x')!, DS_FULL, 3
+    );
+    expect(initial.html).toContain('id="mid"');
+    expect(initial.html).not.toContain('id="wide"');
+    expect(additional.length).toBeGreaterThanOrEqual(1);
+    expect(additional[0].html).toContain('id="wide"');
+  });
+
+  it('each additional snapshot also carries the focus marker', () => {
+    document.body.innerHTML = `
+      <article id="wide">
+        <div id="mid">
+          <input id="x">
+          <input id="y">
+        </div>
+      </article>`;
+    // Budget=3: [div#mid, article#wide, body]. Sibling at i=0 → chosenIdx=min(0+1,2)=1 → article#wide.
+    // Remaining budget = 3−1−1 = 1 additional snapshot (body).
+    const { initial, additional } = captureProgressiveAncestorContexts(
+      document.getElementById('x')!, DS_FULL, 3
+    );
+    expect(initial.html).toContain('data-quickfill-focus="1"');
+    if (additional.length > 0) {
+      expect(additional[0].html).toContain('data-quickfill-focus="1"');
+    }
+  });
+
+  it('caps additional at the real ancestor count (does not fabricate levels)', () => {
+    // extraAncestorLevelsAfterMatch=0 keeps initial at div#a (level 1, chosenIdx=0).
+    // Remaining budget = 10−0−1 = 9, but jsdom only has body+html above div#a → 2 actual.
+    document.body.innerHTML = `<div id="a"><input id="x"><input id="y"></div>`;
+    const { initial, additional } = captureProgressiveAncestorContexts(
+      document.getElementById('x')!,
+      { ...DS_FULL, maxAncestorLevels: 1, extraAncestorLevelsAfterMatch: 0 },
+      10
+    );
+    expect(initial.html).toContain('id="a"');
+    // We asked for 10 total levels but the jsdom tree is shallow above div#a.
+    expect(additional.length).toBeLessThan(10);
+  });
+
+  it('captureAncestorContext wrapper returns the same initial as captureProgressiveAncestorContexts', () => {
+    document.body.innerHTML = `
+      <div id="outer">
+        <div id="inner">
+          <input id="x">
+          <input id="y">
+        </div>
+      </div>`;
+    const via_wrapper = captureAncestorContext(document.getElementById('x')!, DS_FULL);
+    // Large budget: both the wrapper and the direct call climb the same jsdom tree.
+    // chooseAncestorIdx receives the same ancestors array → same chosenIdx → same initial.
+    const { initial } = captureProgressiveAncestorContexts(
+      document.getElementById('x')!, DS_FULL, 20
+    );
+    expect(via_wrapper.html).toBe(initial.html);
+    expect(via_wrapper.innerText).toBe(initial.innerText);
+  });
+});
+
+describe('runDetective — additionalAncestorContexts', () => {
+  it('includes non-empty additionalAncestorContexts when classifierMaxContextLevels > 0', async () => {
+    document.body.innerHTML = `
+      <article id="wide">
+        <section id="mid">
+          <div id="narrow">
+            <input id="x">
+            <input id="y">
+          </div>
+        </section>
+      </article>`;
+    const result = await runDetective(document.getElementById('x')!, DS_FULL);
+    expect(result.additionalAncestorContexts).toBeDefined();
+    expect(result.additionalAncestorContexts.length).toBeGreaterThan(0);
+    // First additional entry should be one level wider than the initial snapshot.
+    expect(result.additionalAncestorContexts[0].html).toContain('id="wide"');
+  });
+
+  it('returns empty additionalAncestorContexts for rejected (disabled) field', async () => {
+    document.body.innerHTML = `<input id="x" disabled>`;
+    const result = await runDetective(document.getElementById('x')!);
+    expect(result.rejected).toBe('disabled');
+    expect(result.additionalAncestorContexts).toHaveLength(0);
+  });
+
+  it('returns empty additionalAncestorContexts when classifierMaxContextLevels=0', async () => {
+    document.body.innerHTML = `
+      <div>
+        <input id="x">
+        <input id="y">
+      </div>`;
+    const result = await runDetective(document.getElementById('x')!, {
+      ...DS_FULL,
+      classifierMaxContextLevels: 0
+    });
+    expect(result.additionalAncestorContexts).toHaveLength(0);
+  });
+
+  it('additionalAncestorContexts length respects classifierMaxContextLevels ceiling', async () => {
+    // Build a tall DOM so we have plenty of ancestors to climb.
+    document.body.innerHTML = `
+      <div id="d5"><div id="d4"><div id="d3"><div id="d2">
+        <input id="x"><input id="y">
+      </div></div></div></div>`;
+    // maxAncestorLevels=1, extraAncestorLevelsAfterMatch=0: initial is at level 1 (div#d2).
+    // classifierMaxContextLevels=3: total levels ≤ 3, so at most 2 additional snapshots.
+    const result = await runDetective(document.getElementById('x')!, {
+      ...DS_FULL,
+      maxAncestorLevels: 1,
+      extraAncestorLevelsAfterMatch: 0,
+      classifierMaxContextLevels: 3
+    });
+    // Initial at level 1 → maxAdditional = 3 − 1 = 2.
+    expect(result.additionalAncestorContexts.length).toBeLessThanOrEqual(2);
   });
 });

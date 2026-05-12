@@ -241,8 +241,9 @@ type Settings = {
   detector: {
     maxAncestorHtml:               number;    // default 15000 — max chars of cleaned ancestor outerHTML sent to classifier.
     maxAncestorInnerText:          number;    // default 300   — max chars of ancestor innerText sidecar.
-    maxAncestorLevels:             number;    // default 7     — hard ceiling on total levels climbed (covers both the search step AND the extra levels below).
-    extraAncestorLevelsAfterMatch: number;    // default 2     — once an ancestor with another form control is found, climb this many more levels before snapshotting. Jointly bounded by maxAncestorLevels.
+    maxAncestorLevels:             number;    // default 3     — search window: how many levels up the detector scans when looking for an ancestor that contains a different form control.
+    extraAncestorLevelsAfterMatch: number;    // default 2     — once the sibling-bearing ancestor is found, climb this many more levels before snapshotting. These extra levels can push the chosen ancestor beyond maxAncestorLevels.
+    classifierMaxContextLevels:    number;    // default 12    — total DOM levels the classifier may examine across all context snapshots combined (initial + any wider snapshots requested via need_more_context). The initial snapshot alone may consume up to maxAncestorLevels + extraAncestorLevelsAfterMatch levels. If exhausted without a decision, an error is shown.
     maxAttrValueLen:               number;    // default 120   — attribute values longer than this are truncated during HTML cleaning.
   };
   // Override `getContextWindow(modelId)` for custom Ollama models (§6.3).
@@ -628,13 +629,27 @@ classifier sees:
   structural context — the strongest signal for which fieldset / template
   section the field belongs to (e.g. "Experience #2"). The detective climbs
   up to the first ancestor whose subtree contains a *different* form
-  control than the focused one and then takes
-  `detector.extraAncestorLevelsAfterMatch` more levels beyond it (default 2,
-  jointly capped at `detector.maxAncestorLevels` = 7), so depth adapts to
-  the actual form structure. Some sites bury the question text high above
-  the input — bumping `extraAncestorLevelsAfterMatch` (and, if needed,
-  `maxAncestorLevels`) lets the user broaden the snapshot when the default
-  doesn't capture enough context. The
+  control than the focused one (scanning up to `detector.maxAncestorLevels`
+  levels, default 3) and then takes
+  `detector.extraAncestorLevelsAfterMatch` more levels beyond it (default 2);
+  these extra levels can push the chosen ancestor past `maxAncestorLevels`,
+  so the maximum initial depth is
+  `maxAncestorLevels + extraAncestorLevelsAfterMatch`. The detective also
+  pre-captures a series of progressively wider ancestor snapshots (one DOM
+  level higher each time). The classifier receives the initial snapshot
+  first; if context is insufficient it may respond `need_more_context` to
+  step through the additional snapshots in sequence. The total DOM levels
+  examined across all snapshots is bounded by
+  `detector.classifierMaxContextLevels` (default 12): the initial snapshot
+  alone may consume up to `maxAncestorLevels + extraAncestorLevelsAfterMatch`
+  levels of the budget, and the remainder is available for additional wider
+  snapshots. If the budget is exhausted without a final classification
+  decision, an error message is shown directing the user to the manual
+  highlight fallback (Alt+Shift+A) rather than silently falling back to
+  `story_answer`. Some sites bury the question text high above the input —
+  bumping `extraAncestorLevelsAfterMatch` (and, if needed, `maxAncestorLevels`)
+  widens the initial snapshot; increasing `classifierMaxContextLevels` raises
+  the total search budget. The
   focused element inside the snippet is tagged with
   `data-quickfill-focus="1"` so the classifier can locate it directly. The
   snippet is then cleaned (style/class/script/svg/event-handler attributes

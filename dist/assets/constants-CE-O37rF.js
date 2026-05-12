@@ -1,9 +1,10 @@
-const s=2e5,r="SHA-256",l=16,c=12,p=256,u="Xenova/all-MiniLM-L6-v2",d=384,m=2e3,h=6,y=16,g=256,f=["phone","phone number","mobile phone","address","street address","home address","mailing address","date of birth","birth date","dob","ssn","social security number","tax id","passport","passport number","driver license","drivers license","national id","national insurance","bank account","iban","salary","current salary","desired salary","gender","race","ethnicity","sexual orientation","disability","veteran status"],o={classifier:{temperature:0,maxTokens:512},chooser:{temperature:0,maxTokens:128},answer_length:{temperature:0,maxTokens:256},story_answer_prompt:{temperature:.2,maxTokens:600},resume_parse:{temperature:0,maxTokens:10240},story_discovery:{temperature:0,maxTokens:768},generic_key:{temperature:0,maxTokens:512},alias_judge:{temperature:0,maxTokens:64}};function x(t,a){const e=o[t],i=a[t];return{temperature:i?.temperature??e.temperature,maxTokens:i?.maxTokens??e.maxTokens}}const b={activeBackend:"ollama",backends:{anthropic:{apiKey:"",model:"claude-sonnet-4-6"},openai:{apiKey:"",model:"gpt-5-mini"},gemini:{apiKey:"",model:"gemini-3-flash-preview"},ollama:{baseUrl:"http://localhost:11434",model:"gemma4:e4b"}},prompts:{},promptParams:{},matching:{fuseThreshold:.1},rag:{historyGenericKeyWeight:.3,minTokens:1024,contextPercent:25},dedup:{questionSimilarityThreshold:.85,genericKeySimilarityThreshold:.75},logging:{enabled:!0,logPayloads:!1,showDiagnostics:!1},session:{inactivityMinutes:15},navigator:{prevKey:",",nextKey:"."},detector:{maxAncestorHtml:15e3,maxAncestorInnerText:300,maxAncestorLevels:7,extraAncestorLevelsAfterMatch:2,maxAttrValueLen:120},customContextWindows:{}},n={classifier:`You are an expert data classification agent routing a job application form field into one of three strict categories.
+const s=2e5,r="SHA-256",l=16,c=12,u=256,p="Xenova/all-MiniLM-L6-v2",d=384,h=2e3,m=6,y=16,g=256,f=["phone","phone number","mobile phone","address","street address","home address","mailing address","date of birth","birth date","dob","ssn","social security number","tax id","passport","passport number","driver license","drivers license","national id","national insurance","bank account","iban","salary","current salary","desired salary","gender","race","ethnicity","sexual orientation","disability","veteran status"],o={classifier:{temperature:0,maxTokens:512},chooser:{temperature:0,maxTokens:128},answer_length:{temperature:0,maxTokens:256},story_answer_prompt:{temperature:.2,maxTokens:600},resume_parse:{temperature:0,maxTokens:10240},story_discovery:{temperature:0,maxTokens:768},generic_key:{temperature:0,maxTokens:512},alias_judge:{temperature:0,maxTokens:64}};function x(t,a){const e=o[t],i=a[t];return{temperature:i?.temperature??e.temperature,maxTokens:i?.maxTokens??e.maxTokens}}const b={activeBackend:"ollama",backends:{anthropic:{apiKey:"",model:"claude-sonnet-4-6"},openai:{apiKey:"",model:"gpt-5-mini"},gemini:{apiKey:"",model:"gemini-3-flash-preview"},ollama:{baseUrl:"http://localhost:11434",model:"gemma4:e4b"}},prompts:{},promptParams:{},matching:{fuseThreshold:.1},rag:{historyGenericKeyWeight:.3,minTokens:1024,contextPercent:25},dedup:{questionSimilarityThreshold:.85,genericKeySimilarityThreshold:.75},logging:{enabled:!0,logPayloads:!1,showDiagnostics:!1},session:{inactivityMinutes:15},navigator:{prevKey:",",nextKey:"."},detector:{maxAncestorHtml:15e3,maxAncestorInnerText:300,maxAncestorLevels:3,extraAncestorLevelsAfterMatch:2,maxAttrValueLen:120,classifierMaxContextLevels:12},customContextWindows:{}},n={classifier:`You are an expert data classification agent routing a job application form field into one of four categories.
 
 <categories>
 1. "profile_existing_value": A data point already present in the user's stored data — either a flat profile key, OR a slot inside one of the user's group templates (e.g. a Work Experience or Education record). Group-template fields commonly REPEAT across records (every work experience has its own "job title", "company", "start date", etc.) so when the surrounding HTML places the focused field inside a section that looks like one of these templates, prefer the template target.
 2. "profile_update": A basic personal data point NOT yet in the profile and NOT a slot inside any existing group template (e.g., middle name, pronouns, personal website). Suggest a normalized key (lowercase, spaces only).
 3. "story_answer": A narrative, open-ended, or experiential question requiring an essay or paragraph (e.g., "Tell us about a time...", "Why this company?").
+4. "need_more_context": The surrounding HTML context is genuinely too sparse to determine what the field is asking — for example, the snippet contains only the bare input element with no visible label, legend, aria attribute, or adjacent text. Using this triggers a re-call with one additional level of ancestor HTML. Use sparingly and only when classification is highly uncertain.
 </categories>
 
 <context>
@@ -18,13 +19,13 @@ Existing group templates (each template is a schema for a list of records — Wo
 Pre-selected match candidates from the fuzzy matcher (these are the ONLY plausible "profile_existing_value" targets unless the matcher produced none; pick from this list when non-empty):
 {{match_candidates}}
 
-Focused element descriptor (compact identifier — fallback when the surrounding HTML is not available):
+Focused element descriptor:
 {{element_descriptor}}
 
 Surrounding HTML context (outerHTML of an ancestor of the focused field — cleaned of styling noise and pruned so cousin subtrees are flattened to their visible text). The focused element inside this snippet is tagged with the attribute data-quickfill-focus="1" — locate it by that marker. This is your PRIMARY source of truth for what the field is asking:
 {{ancestor_html}}
 
-Plain-text innerText of the same ancestor (a noise-free sidecar — useful when the HTML is hard to read, but the HTML above is still the primary source):
+Plain-text innerText of the HTML context root (a noise-free sidecar — useful when the HTML is hard to read, but the HTML above is still the primary source):
 {{ancestor_inner_text}}
 </context>
 
@@ -38,6 +39,8 @@ Use the surrounding HTML to:
 - Recognize explicit labels, fieldset legends, aria-labelledby targets, or text nodes adjacent to the element
 
 When match candidates were pre-selected, you must either pick exactly one of them OR escalate to "profile_update" / "story_answer". Do not invent a different canonicalKey or template.
+
+Only output "need_more_context" when the surrounding context truly does not contain enough signal about what the field is asking. If you can make a reasonable determination, use one of the first three categories instead.
 </instructions>
 
 <rules>
@@ -55,6 +58,9 @@ Template 2 (New Value):
 
 Template 3 (Story Required):
 {"category": "story_answer"}
+
+Template 4 (More context needed):
+{"category": "need_more_context"}
 </rules>
 
 <examples>
@@ -69,6 +75,9 @@ Output: {"category":"profile_update","canonicalKey":"personal website"}
 
 If you recognize the Label as "Describe a complex technical challenge you solved":
 Output: {"category":"story_answer"}
+
+If the surrounding HTML only shows <input data-quickfill-focus="1">, or it has a generic label like "Value" with no other text, or possibly with extra encompassing divs with no useful information, or other situations where there is not enough information to determine the field's purpose:
+Output: {"category":"need_more_context"}
 </examples>
 
 Output:`,chooser:`You are an expert data matcher resolving a stored profile value to a closed list of dropdown/radio options.
@@ -302,5 +311,5 @@ Canonical key: "email"; Label: "Reference #2 email at previous employer" -> {"is
 Canonical key: "linkedin"; Label: "URL" (only matched via surrounding context) -> {"isAlias": false}
 </examples>
 
-Output:`};function _(t,a){const e=a[t];return typeof e=="string"&&e.trim().length>0?e:n[t]}export{c as A,b as D,u as E,s as K,m as L,y as R,f as S,o as a,n as b,p as c,l as d,r as e,g as f,h as g,x as h,d as i,_ as r};
-//# sourceMappingURL=constants-DNlTX_uG.js.map
+Output:`};function _(t,a){const e=a[t];return typeof e=="string"&&e.trim().length>0?e:n[t]}export{c as A,b as D,p as E,s as K,h as L,y as R,f as S,o as a,n as b,u as c,l as d,r as e,g as f,m as g,x as h,d as i,_ as r};
+//# sourceMappingURL=constants-CE-O37rF.js.map

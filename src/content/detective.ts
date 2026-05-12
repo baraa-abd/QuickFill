@@ -20,14 +20,18 @@ export type DetectiveResult = {
   };
   /**
    * Cleaned + pruned outerHTML of a smartly chosen ancestor of the focused
-   * element (climb up to the first ancestor containing a *different* input
-   * field, plus one more level, capped at 6 levels). The focused element
-   * carries a `data-quickfill-focus="1"` marker so the classifier can locate
-   * it inside the snippet. Capped at MAX_ANCESTOR_HTML chars.
+   * element. The focused element carries a `data-quickfill-focus="1"` marker
+   * so the classifier can locate it inside the snippet.
    */
   ancestorHtml: string | null;
-  /** Plain-text innerText of the same ancestor, capped at MAX_ANCESTOR_INNER_TEXT chars. */
+  /** Plain-text innerText of the same ancestor, capped at maxAncestorInnerText chars. */
   ancestorInnerText: string | null;
+  /**
+   * Progressive wider-ancestor snapshots for the agentic classifier loop.
+   * Index 0 is one DOM level above the initial ancestor, index 1 is two
+   * levels above, etc. Populated up to classifierMaxContextLevels entries.
+   */
+  additionalAncestorContexts: { html: string | null; innerText: string | null }[];
   /** Compact tag + key attributes for the focused element — fallback identifier when ancestorHtml is null. */
   elementDescriptor: string;
   rejected: 'disabled' | 'readonly' | 'file' | null;
@@ -247,9 +251,10 @@ export function getCurrentValue(el: Element): string {
 // Fallback defaults used when no detector settings are supplied.
 const DEFAULT_MAX_ANCESTOR_HTML = 15000;
 const DEFAULT_MAX_ANCESTOR_INNER_TEXT = 300;
-const DEFAULT_MAX_ANCESTOR_LEVELS = 7;
+const DEFAULT_MAX_ANCESTOR_LEVELS = 3;
 const DEFAULT_EXTRA_ANCESTOR_LEVELS_AFTER_MATCH = 2;
 const DEFAULT_MAX_ATTR_VALUE_LEN = 120;
+const DEFAULT_CLASSIFIER_MAX_CONTEXT_LEVELS = 12;
 
 const FOCUS_MARKER_ATTR = 'data-quickfill-focus';
 
@@ -288,64 +293,49 @@ export type AncestorContext = {
   innerText: string | null;
 };
 
+// ── internal helpers ──
+
 /**
- * Capture structural + textual context for the classifier.
+ * Given the full ancestor array (closest first), choose the index of the best
+ * snapshot ancestor using the "first ancestor with a sibling control + extraLevels
+ * more" heuristic.
  *
- * 1. Climb up to the smallest ancestor whose subtree contains a *different*
- *    form control than the focused element, then go `extraAncestorLevelsAfterMatch`
- *    levels beyond it (capped at MAX_ANCESTOR_LEVELS). This adapts depth to
- *    the actual form structure rather than using a fixed level.
- * 2. Clone the chosen ancestor so all subsequent edits are off-DOM.
- * 3. Tag the focused element's clone with `data-quickfill-focus="1"` so the
- *    classifier can locate it inside the snippet without relying on
- *    elementDescriptor matching being unambiguous.
- * 4. Clean: drop noise tags (script/style/svg/...), drop comments, strip all
- *    attributes except a small allowlist, truncate long attribute values.
- * 5. Prune (text-preserving): elements *not* on the focused element's
- *    ancestor spine are flattened to their visible text — wrapper tag is
- *    kept so nearby labels remain locatable, but their nested structure
- *    (deep cousin branches) is discarded.
- * 6. Truncate: if the result still exceeds MAX_ANCESTOR_HTML, take a window
- *    ending right after the focused element's closing tag and extending
- *    backward as far as possible (information before the focus is more
- *    important — the focus is typically near the bottom of its own
- *    subtree).
- *
- * The plain-text `innerText` of the same ancestor (capped) is returned
- * alongside as a dense sidecar that's robust to HTML noise.
+ * @param ancestors  Full ancestor array (as tall as the caller climbed).
+ * @param el         The focused element.
+ * @param searchSize How many ancestors to scan for a sibling form control
+ *                   (corresponds to maxAncestorLevels).
+ * @param extraLevels Extra levels to climb above the matched ancestor. These can
+ *                   push chosenIdx beyond searchSize when the DOM is deep enough.
  */
-export function captureAncestorContext(el: Element, ds?: DetectorSettings): AncestorContext {
-  const maxLevels    = ds?.maxAncestorLevels    ?? DEFAULT_MAX_ANCESTOR_LEVELS;
-  const extraLevels  = Math.max(
-    0,
-    ds?.extraAncestorLevelsAfterMatch ?? DEFAULT_EXTRA_ANCESTOR_LEVELS_AFTER_MATCH
-  );
-  const maxInnerText = ds?.maxAncestorInnerText ?? DEFAULT_MAX_ANCESTOR_INNER_TEXT;
-  const maxHtml      = ds?.maxAncestorHtml      ?? DEFAULT_MAX_ANCESTOR_HTML;
-  const maxAttrLen   = ds?.maxAttrValueLen      ?? DEFAULT_MAX_ATTR_VALUE_LEN;
-
-  const ancestors: Element[] = [];
-  let cur = el.parentElement;
-  while (cur && ancestors.length < maxLevels) {
-    ancestors.push(cur);
-    cur = cur.parentElement;
-  }
-  if (ancestors.length === 0) return { html: null, innerText: null };
-
-  // Climb to the smallest ancestor whose subtree contains a form control
-  // distinct from the focused element, then continue `extraLevels` more
-  // levels (some sites bury the question text high above the input).
-  // Both steps are jointly capped by `maxLevels` via the `ancestors` array
-  // length: even if extraLevels is large, we never read past the array end.
-  let chosenIdx = ancestors.length - 1;
-  for (let i = 0; i < ancestors.length; i++) {
+function chooseAncestorIdx(
+  ancestors: Element[],
+  el: Element,
+  searchSize: number,
+  extraLevels: number
+): number {
+  const windowEnd = Math.min(searchSize, ancestors.length);
+  for (let i = 0; i < windowEnd; i++) {
     if (containsDifferentFormControl(ancestors[i], el)) {
-      chosenIdx = Math.min(i + extraLevels, ancestors.length - 1);
-      break;
+      return Math.min(i + extraLevels, ancestors.length - 1);
     }
   }
-  const ancestor = ancestors[chosenIdx];
+  // No sibling control found — use the deepest ancestor in the search window.
+  // Extra levels are not added when there is no sibling match.
+  return windowEnd - 1;
+}
 
+/**
+ * Capture the ancestor-HTML + innerText context for a specific ancestor
+ * element. Clones, tags the focused element with the focus marker, cleans,
+ * prunes, and truncates — all off-DOM.
+ */
+function captureFromAncestor(
+  ancestor: Element,
+  el: Element,
+  maxHtml: number,
+  maxInnerText: number,
+  maxAttrLen: number
+): AncestorContext {
   // Path from ancestor down to the focused element (childIndex per level).
   const path: number[] = [];
   let p: Element = el;
@@ -385,6 +375,79 @@ export function captureAncestorContext(el: Element, ds?: DetectorSettings): Ance
   const fullHtml = clone.outerHTML;
   const html = truncateAroundFocus(fullHtml, focusedClone.outerHTML, maxHtml);
   return { html, innerText };
+}
+
+/**
+ * Capture the initial ancestor context plus progressive wider-ancestor snapshots
+ * for the agentic classifier loop.
+ *
+ * @param maxTotalLevels  Total number of DOM levels that may be climbed across the
+ *   initial snapshot AND all additional snapshots combined. The initial snapshot
+ *   searches the first `maxAncestorLevels` ancestors for a sibling control and then
+ *   climbs `extraAncestorLevelsAfterMatch` higher — that consumed level count is
+ *   subtracted from `maxTotalLevels` to derive how many additional snapshots remain.
+ *
+ * Example with defaults (maxAncestorLevels=3, extraAncestorLevelsAfterMatch=2):
+ *   - Sibling found at level 1 → initial at level 1+2=3 → budget for additional = maxTotalLevels−3.
+ *   - Sibling found at level 3 → initial at level 3+2=5 → budget for additional = maxTotalLevels−5.
+ */
+export function captureProgressiveAncestorContexts(
+  el: Element,
+  ds: DetectorSettings | undefined,
+  maxTotalLevels: number
+): { initial: AncestorContext; additional: AncestorContext[] } {
+  const maxLevels   = ds?.maxAncestorLevels    ?? DEFAULT_MAX_ANCESTOR_LEVELS;
+  const extraLevels = Math.max(
+    0,
+    ds?.extraAncestorLevelsAfterMatch ?? DEFAULT_EXTRA_ANCESTOR_LEVELS_AFTER_MATCH
+  );
+  const maxInnerText = ds?.maxAncestorInnerText ?? DEFAULT_MAX_ANCESTOR_INNER_TEXT;
+  const maxHtml      = ds?.maxAncestorHtml      ?? DEFAULT_MAX_ANCESTOR_HTML;
+  const maxAttrLen   = ds?.maxAttrValueLen      ?? DEFAULT_MAX_ATTR_VALUE_LEN;
+
+  // Climb at most maxTotalLevels ancestors (the budget for all snapshots combined).
+  const ancestors: Element[] = [];
+  let cur = el.parentElement;
+  while (cur && ancestors.length < maxTotalLevels) {
+    ancestors.push(cur);
+    cur = cur.parentElement;
+  }
+  if (ancestors.length === 0) return { initial: { html: null, innerText: null }, additional: [] };
+
+  // Initial snapshot: search the first maxLevels ancestors for a sibling control,
+  // then climb extraLevels higher. extraLevels can push chosenIdx beyond maxLevels
+  // when the DOM is deep enough (e.g. sibling at level maxLevels + 2 extra = level
+  // maxLevels+extraLevels in the worst case).
+  const chosenIdx = chooseAncestorIdx(ancestors, el, maxLevels, extraLevels);
+  const initial = captureFromAncestor(ancestors[chosenIdx], el, maxHtml, maxInnerText, maxAttrLen);
+
+  // Additional snapshots: one DOM level higher each time, within the remaining budget.
+  // The initial consumed levels 1..(chosenIdx+1) in 1-indexed terms, so the
+  // remaining slots are (maxTotalLevels − chosenIdx − 1).
+  const maxAdditional = Math.max(0, maxTotalLevels - chosenIdx - 1);
+  const additional: AncestorContext[] = [];
+  for (let i = 1; i <= maxAdditional; i++) {
+    const idx = chosenIdx + i;
+    if (idx >= ancestors.length) break;
+    additional.push(captureFromAncestor(ancestors[idx], el, maxHtml, maxInnerText, maxAttrLen));
+  }
+
+  return { initial, additional };
+}
+
+/**
+ * Thin wrapper for callers that only need the initial ancestor snapshot.
+ * Passes a budget of maxAncestorLevels + extraAncestorLevelsAfterMatch, which
+ * is sufficient for the initial heuristic climb and leaves no meaningful
+ * additional budget (the .additional array is discarded).
+ */
+export function captureAncestorContext(el: Element, ds?: DetectorSettings): AncestorContext {
+  const maxLevels   = ds?.maxAncestorLevels    ?? DEFAULT_MAX_ANCESTOR_LEVELS;
+  const extraLevels = Math.max(
+    0,
+    ds?.extraAncestorLevelsAfterMatch ?? DEFAULT_EXTRA_ANCESTOR_LEVELS_AFTER_MATCH
+  );
+  return captureProgressiveAncestorContexts(el, ds, maxLevels + extraLevels).initial;
 }
 
 function containsDifferentFormControl(ancestor: Element, focused: Element): boolean {
@@ -481,15 +544,33 @@ export function capturePageContext(): DetectiveResult['pageContext'] {
 
 export async function runDetective(el: Element, ds?: DetectorSettings): Promise<DetectiveResult> {
   const { fieldType, rejected } = classifyFieldType(el);
-  const ancestor = rejected ? { html: null, innerText: null } : captureAncestorContext(el, ds);
+
+  let ancestorHtml: string | null = null;
+  let ancestorInnerText: string | null = null;
+  let additionalAncestorContexts: AncestorContext[] = [];
+
+  if (!rejected) {
+    // classifierMaxContextLevels is the total number of DOM levels that may be
+    // climbed across the initial snapshot and all additional snapshots combined.
+    // The initial itself may consume multiple levels (up to maxAncestorLevels +
+    // extraAncestorLevelsAfterMatch), so the remaining budget for additional
+    // snapshots varies and is computed inside captureProgressiveAncestorContexts.
+    const totalLevels = ds?.classifierMaxContextLevels ?? DEFAULT_CLASSIFIER_MAX_CONTEXT_LEVELS;
+    const { initial, additional } = captureProgressiveAncestorContexts(el, ds, totalLevels);
+    ancestorHtml = initial.html;
+    ancestorInnerText = initial.innerText;
+    additionalAncestorContexts = additional;
+  }
+
   return {
     question: rejected ? null : climbForLabel(el),
     fieldType,
     options: rejected ? null : await getOptions(el, fieldType),
     currentValue: rejected ? '' : getCurrentValue(el),
     pageContext: capturePageContext(),
-    ancestorHtml: ancestor.html,
-    ancestorInnerText: ancestor.innerText,
+    ancestorHtml,
+    ancestorInnerText,
+    additionalAncestorContexts,
     elementDescriptor: buildElementDescriptor(el),
     rejected
   };

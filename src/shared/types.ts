@@ -166,23 +166,27 @@ export type Settings = {
     nextKey: string;
   };
   detector: {
-    /** Max characters of cleaned ancestor outerHTML sent to the classifier. Default 15000. */
+    /** Max characters of cleaned ancestor outerHTML sent to the classifier.  */
     maxAncestorHtml: number;
-    /** Max characters of ancestor innerText sidecar. Default 300. */
+    /** Max characters of ancestor innerText sidecar.  */
     maxAncestorInnerText: number;
-    /** Max ancestor levels climbed when looking for a sibling form control. Default 7.
-     *  This bound is the hard ceiling for *both* the search-for-second-control
-     *  step AND the additional climb beyond it (see
-     *  `extraAncestorLevelsAfterMatch`). */
+    /** Max ancestor levels climbed during the *initial* scrape when searching
+     *  for an ancestor whose subtree contains a different form control.
+     *  This is now only the initial-scrape ceiling; additional context is
+     *  captured progressively as the classifier requests more (see
+     *  `classifierMaxContextLevels`). */
     maxAncestorLevels: number;
-    /** Once an ancestor whose subtree contains a form control distinct from
-     *  the focused element is found, the detective climbs this many levels
-     *  further before snapshotting the HTML. Some sites bury the question
-     *  text high above the input, so a value of 2+ is sometimes needed.
-     *  Default 2. Clamped at runtime by `maxAncestorLevels - matchedIndex`. */
+    /** Once an ancestor containing a second form control is found during the
+     *  initial scrape, climb this many more levels before snapshotting.
+     *  Clamped at runtime by `maxAncestorLevels - matchedIndex`. */
     extraAncestorLevelsAfterMatch: number;
-    /** Attribute values longer than this are truncated during HTML cleaning. Default 120. */
+    /** Attribute values longer than this are truncated during HTML cleaning. */
     maxAttrValueLen: number;
+    /** Maximum number of times the classifier may request a wider ancestor
+     *  context (Template 4 / need_more_context response) before the session
+     *  falls back to story_answer. Each request provides one
+     *  additional DOM level above the previous snapshot. */
+    classifierMaxContextLevels: number;
   };
   customContextWindows: Record<string, number>;
 };
@@ -230,6 +234,10 @@ export type FillPlan = {
   ancestorHtml: string | null;
   /** Plain-text innerText of the same ancestor (capped) as a noise-free sidecar. */
   ancestorInnerText: string | null;
+  /** Progressive wider-ancestor snapshots for the agentic classifier loop.
+   *  Index 0 is one DOM level above the initial ancestor, index 1 is two levels
+   *  above, etc. Each entry is capped the same as ancestorHtml/ancestorInnerText. */
+  additionalAncestorContexts: { html: string | null; innerText: string | null }[];
   /** Compact tag + key attributes identifying the focused field — fallback when ancestorHtml is null. */
   elementDescriptor: string;
   elementRef: string;

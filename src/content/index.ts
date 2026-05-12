@@ -166,7 +166,9 @@ import type { FieldType } from '$shared/types';
             return;
           }
           const focused = document.activeElement as Element;
-          const result = await runDetective(focused, ev.detector);
+          // ev.detector uses .optional() for back-compat fields; runDetective
+          // handles undefined values via ?? fallbacks, so the cast is safe.
+          const result = await runDetective(focused, ev.detector as Parameters<typeof runDetective>[1]);
           if (result.rejected) {
             port?.post({
               t: 'detective-failed',
@@ -185,6 +187,7 @@ import type { FieldType } from '$shared/types';
               pageContext: result.pageContext,
               ancestorHtml: result.ancestorHtml,
               ancestorInnerText: result.ancestorInnerText,
+              additionalAncestorContexts: result.additionalAncestorContexts,
               elementDescriptor: result.elementDescriptor,
               elementRef,
               tabId: -1, // SW will overwrite from sender.tab.id

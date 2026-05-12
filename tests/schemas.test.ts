@@ -30,6 +30,7 @@ describe('schemas round-trip', () => {
       dedup: { questionSimilarityThreshold: 0.85, genericKeySimilarityThreshold: 0.75 },
       logging: { enabled: true, logPayloads: false, showDiagnostics: false },
       session: { inactivityMinutes: 15 },
+      navigator: DEFAULT_SETTINGS.navigator,
       customContextWindows: {}
     };
     const result = settingsSchema.safeParse(old);
@@ -108,6 +109,79 @@ describe('schemas round-trip', () => {
         frameId: 0
       }).success
     ).toBe(true);
+  });
+
+  it('fillPlanSchema defaults additionalAncestorContexts to [] when absent (backwards compat)', () => {
+    const result = fillPlanSchema.safeParse({
+      question: null,
+      fieldType: 'text',
+      options: null,
+      currentValue: '',
+      pageContext: { title: '', hostname: '', siteName: null, h1: null },
+      elementRef: 'uuid',
+      tabId: 1,
+      frameId: 0
+      // intentionally omitting additionalAncestorContexts
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.additionalAncestorContexts).toEqual([]);
+    }
+  });
+
+  it('fillPlanSchema accepts non-empty additionalAncestorContexts', () => {
+    const result = fillPlanSchema.safeParse({
+      question: 'Why us?',
+      fieldType: 'textarea',
+      options: null,
+      currentValue: '',
+      pageContext: { title: '', hostname: '', siteName: null, h1: null },
+      additionalAncestorContexts: [
+        { html: '<div>foo</div>', innerText: 'foo' },
+        { html: null, innerText: null }
+      ],
+      elementRef: 'uuid',
+      tabId: 1,
+      frameId: 0
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.additionalAncestorContexts).toHaveLength(2);
+      expect(result.data.additionalAncestorContexts[0].html).toBe('<div>foo</div>');
+      expect(result.data.additionalAncestorContexts[1].html).toBeNull();
+    }
+  });
+
+  it('settingsSchema defaults classifierMaxContextLevels to 12 when detector field is absent', () => {
+    // Simulate stored settings from a version before classifierMaxContextLevels existed,
+    // but with the rest of the detector object intact.
+    const { classifierMaxContextLevels: _drop, ...detectorWithout } = DEFAULT_SETTINGS.detector;
+    const s = { ...DEFAULT_SETTINGS, detector: detectorWithout };
+    const result = settingsSchema.safeParse(s);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.detector.classifierMaxContextLevels).toBe(12);
+    }
+  });
+
+  it('settingsSchema back-fills all detector defaults when whole detector absent', () => {
+    const { detector: _drop, ...withoutDetector } = DEFAULT_SETTINGS;
+    const result = settingsSchema.safeParse(withoutDetector);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.detector.maxAncestorLevels).toBe(DEFAULT_SETTINGS.detector.maxAncestorLevels);
+      expect(result.data.detector.extraAncestorLevelsAfterMatch).toBe(DEFAULT_SETTINGS.detector.extraAncestorLevelsAfterMatch);
+      expect(result.data.detector.classifierMaxContextLevels).toBe(12);
+    }
+  });
+
+  it('settingsSchema accepts explicit classifierMaxContextLevels value', () => {
+    const s = { ...DEFAULT_SETTINGS, detector: { ...DEFAULT_SETTINGS.detector, classifierMaxContextLevels: 5 } };
+    const result = settingsSchema.safeParse(s);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.detector.classifierMaxContextLevels).toBe(5);
+    }
   });
 
   it('logEntrySchema rejects unknown level', () => {

@@ -255,7 +255,12 @@
 
     <fieldset>
       <legend>Detector</legend>
-      <p class="muted" style="font-size: 12px;">Controls how much page context is captured when detecting what a form field is asking.</p>
+      <p class="muted" style="font-size: 12px;">
+        Controls how much page context is captured for the initial classifier prompt, and how many
+        total DOM levels the classifier may examine across all context snapshots. If the budget is
+        exhausted without a decision, an error is shown and the user is directed to the manual
+        highlight fallback.
+      </p>
       <label class="row">
         <span style="flex: 1;">Max ancestor HTML chars (default {DEFAULT_SETTINGS.detector.maxAncestorHtml})</span>
         <input
@@ -279,7 +284,10 @@
         <button type="button" onclick={() => resetDetector('maxAncestorInnerText')}>Reset</button>
       </label>
       <label class="row">
-        <span style="flex: 1;">Max ancestor levels climbed (default {DEFAULT_SETTINGS.detector.maxAncestorLevels})</span>
+        <span style="flex: 1;">
+          Initial scrape: max ancestor levels climbed (default {DEFAULT_SETTINGS.detector.maxAncestorLevels}).
+          Caps how far up the DOM the detector climbs during the initial context capture.
+        </span>
         <input
           type="number"
           step="1"
@@ -291,10 +299,9 @@
       </label>
       <label class="row">
         <span style="flex: 1;">
-          Extra ancestor levels after finding a second form control
+          Initial scrape: extra levels after finding a sibling control
           (default {DEFAULT_SETTINGS.detector.extraAncestorLevelsAfterMatch}). Once the climber
-          hits an ancestor whose subtree has another input, it goes this many more levels up
-          before snapshotting the HTML. Bounded at runtime by "Max ancestor levels climbed".
+          finds an ancestor with another input, it goes this many more levels up before snapshotting.
         </span>
         <input
           type="number"
@@ -304,6 +311,20 @@
           bind:value={settings.detector.extraAncestorLevelsAfterMatch}
         />
         <button type="button" onclick={() => resetDetector('extraAncestorLevelsAfterMatch')}>Reset</button>
+      </label>
+      <label class="row">
+        <span style="flex: 1;">
+          Max total DOM levels for classifier (default {DEFAULT_SETTINGS.detector.classifierMaxContextLevels}).
+          The levels climbed in the initial scrape count towards this maximum.
+        </span>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          max="30"
+          bind:value={settings.detector.classifierMaxContextLevels}
+        />
+        <button type="button" onclick={() => resetDetector('classifierMaxContextLevels')}>Reset</button>
       </label>
       <label class="row">
         <span style="flex: 1;">Max attribute value length (default {DEFAULT_SETTINGS.detector.maxAttrValueLen})</span>

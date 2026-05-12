@@ -158,16 +158,19 @@ export const settingsSchema = z.object({
       maxAncestorHtml:               z.number().int().min(1000).max(100000),
       maxAncestorInnerText:          z.number().int().min(50).max(2000),
       maxAncestorLevels:             z.number().int().min(1).max(20),
-      // Defaults to 2 if missing (older stored settings predate this knob).
+      // Defaults to 2 if missing.
       extraAncestorLevelsAfterMatch: z.number().int().min(0).max(20).catch(2),
-      maxAttrValueLen:               z.number().int().min(20).max(500)
+      maxAttrValueLen:               z.number().int().min(20).max(500),
+      // Defaults to 12 if missing (older stored settings predate this knob).
+      classifierMaxContextLevels:    z.number().int().min(0).max(30).catch(12)
     })
     .catch({
       maxAncestorHtml:               15000,
       maxAncestorInnerText:          300,
-      maxAncestorLevels:             7,
+      maxAncestorLevels:             3,
       extraAncestorLevelsAfterMatch: 2,
-      maxAttrValueLen:               120
+      maxAttrValueLen:               120,
+      classifierMaxContextLevels:    12
     }),
   customContextWindows: z.record(z.string(), z.number())
 });
@@ -198,6 +201,10 @@ export const fillPlanSchema = z.object({
   }),
   ancestorHtml: z.string().nullable().catch(null),
   ancestorInnerText: z.string().nullable().catch(null),
+  // Backwards-compat: older content scripts won't include this field.
+  additionalAncestorContexts: z.array(
+    z.object({ html: z.string().nullable(), innerText: z.string().nullable() })
+  ).catch([]),
   elementDescriptor: z.string().catch(''),
   elementRef: z.string(),
   tabId: z.number(),

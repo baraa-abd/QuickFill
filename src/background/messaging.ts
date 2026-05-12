@@ -395,9 +395,10 @@ export const portEventSchema = z.discriminatedUnion('t', [
       maxAncestorHtml:               z.number(),
       maxAncestorInnerText:          z.number(),
       maxAncestorLevels:             z.number(),
-      // Optional for back-compat with older SWs / panels that predate the knob.
+      // Optional for back-compat with older SWs that predate these knobs.
       extraAncestorLevelsAfterMatch: z.number().optional(),
-      maxAttrValueLen:               z.number()
+      maxAttrValueLen:               z.number(),
+      classifierMaxContextLevels:    z.number().optional()
     }).optional()
   }),
   z.object({ t: z.literal('fill-plan'), plan: fillPlanSchema }),                        // content → SW

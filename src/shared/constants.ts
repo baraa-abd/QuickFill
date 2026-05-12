@@ -127,9 +127,10 @@ export const DEFAULT_SETTINGS: Settings = {
   detector: {
     maxAncestorHtml:               15000,
     maxAncestorInnerText:          300,
-    maxAncestorLevels:             7,
+    maxAncestorLevels:             3,                                //this and the next parameter are for the initial classifier prompt
     extraAncestorLevelsAfterMatch: 2,
-    maxAttrValueLen:               120
+    maxAttrValueLen:               120,
+    classifierMaxContextLevels:    12
   },
   customContextWindows: {}
 };
@@ -139,12 +140,13 @@ export const DEFAULT_SETTINGS: Settings = {
 // {{snake_case}} variables — missing renders as "".
 
 export const DEFAULT_PROMPT_TEMPLATES: Record<PromptTaskName, string> = {
-  classifier: `You are an expert data classification agent routing a job application form field into one of three strict categories.
+  classifier: `You are an expert data classification agent routing a job application form field into one of four categories.
 
 <categories>
 1. "profile_existing_value": A data point already present in the user's stored data — either a flat profile key, OR a slot inside one of the user's group templates (e.g. a Work Experience or Education record). Group-template fields commonly REPEAT across records (every work experience has its own "job title", "company", "start date", etc.) so when the surrounding HTML places the focused field inside a section that looks like one of these templates, prefer the template target.
 2. "profile_update": A basic personal data point NOT yet in the profile and NOT a slot inside any existing group template (e.g., middle name, pronouns, personal website). Suggest a normalized key (lowercase, spaces only).
 3. "story_answer": A narrative, open-ended, or experiential question requiring an essay or paragraph (e.g., "Tell us about a time...", "Why this company?").
+4. "need_more_context": The surrounding HTML context is genuinely too sparse to determine what the field is asking — for example, the snippet contains only the bare input element with no visible label, legend, aria attribute, or adjacent text. Using this triggers a re-call with one additional level of ancestor HTML. Use sparingly and only when classification is highly uncertain.
 </categories>
 
 <context>
@@ -159,13 +161,13 @@ Existing group templates (each template is a schema for a list of records — Wo
 Pre-selected match candidates from the fuzzy matcher (these are the ONLY plausible "profile_existing_value" targets unless the matcher produced none; pick from this list when non-empty):
 {{match_candidates}}
 
-Focused element descriptor (compact identifier — fallback when the surrounding HTML is not available):
+Focused element descriptor:
 {{element_descriptor}}
 
 Surrounding HTML context (outerHTML of an ancestor of the focused field — cleaned of styling noise and pruned so cousin subtrees are flattened to their visible text). The focused element inside this snippet is tagged with the attribute data-quickfill-focus="1" — locate it by that marker. This is your PRIMARY source of truth for what the field is asking:
 {{ancestor_html}}
 
-Plain-text innerText of the same ancestor (a noise-free sidecar — useful when the HTML is hard to read, but the HTML above is still the primary source):
+Plain-text innerText of the HTML context root (a noise-free sidecar — useful when the HTML is hard to read, but the HTML above is still the primary source):
 {{ancestor_inner_text}}
 </context>
 
@@ -179,6 +181,8 @@ Use the surrounding HTML to:
 - Recognize explicit labels, fieldset legends, aria-labelledby targets, or text nodes adjacent to the element
 
 When match candidates were pre-selected, you must either pick exactly one of them OR escalate to "profile_update" / "story_answer". Do not invent a different canonicalKey or template.
+
+Only output "need_more_context" when the surrounding context truly does not contain enough signal about what the field is asking. If you can make a reasonable determination, use one of the first three categories instead.
 </instructions>
 
 <rules>
@@ -196,6 +200,9 @@ Template 2 (New Value):
 
 Template 3 (Story Required):
 {"category": "story_answer"}
+
+Template 4 (More context needed):
+{"category": "need_more_context"}
 </rules>
 
 <examples>
@@ -210,6 +217,9 @@ Output: {"category":"profile_update","canonicalKey":"personal website"}
 
 If you recognize the Label as "Describe a complex technical challenge you solved":
 Output: {"category":"story_answer"}
+
+If the surrounding HTML only shows <input data-quickfill-focus="1">, or it has a generic label like "Value" with no other text, or possibly with extra encompassing divs with no useful information, or other situations where there is not enough information to determine the field's purpose:
+Output: {"category":"need_more_context"}
 </examples>
 
 Output:`,
